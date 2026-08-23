@@ -59,4 +59,3 @@ watchlist:
   - {symbol: EURUSD, data_symbol: EUR/USD, name: EUR/USD, type: forex, provider: twelvedata}
   - {symbol: USDJPY, data_symbol: USD/JPY, name: USD/JPY, type: forex, provider: twelvedata}
   - {symbol: XAUUSD, data_symbol: XAU/USD, name: Gold XAU/USD, type: metal, provider: twelvedata}
-  - {symbol: XAGUSD, data_symbol: XAG/USD, name: Silver XAG/USD, type: metal, provider: twelvedata}
