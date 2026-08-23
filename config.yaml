@@ -1,0 +1,54 @@
+scanner:
+  minimum_score: 5.0
+  cooldown_minutes: 30
+  max_candle_age_minutes: 20
+
+risk:
+  account_cash_gbp: 1000
+  risk_per_trade_pct: 1.00   # ~£10 planned loss per trade
+  max_cash_exposure_pct: 50
+  atr_stop_multiple: 1.20
+  tp1_r_multiple: 1.50
+  tp2_r_multiple: 2.50
+
+notifications:
+  macos: false
+  telegram: true
+
+# 5-minute watchlist. Add/remove symbols any time.
+watchlist:
+  # US stocks — liquid / higher-volatility focus
+  - {symbol: NVDA, name: NVIDIA, type: stock}
+  - {symbol: TSLA, name: Tesla, type: stock}
+  - {symbol: PLTR, name: Palantir, type: stock}
+  - {symbol: AMD, name: AMD, type: stock}
+  - {symbol: META, name: Meta, type: stock}
+  - {symbol: AMZN, name: Amazon, type: stock}
+  - {symbol: AAPL, name: Apple, type: stock}
+  - {symbol: MSFT, name: Microsoft, type: stock}
+  - {symbol: GOOGL, name: Alphabet, type: stock}
+  - {symbol: AVGO, name: Broadcom, type: stock}
+  - {symbol: MU, name: Micron, type: stock}
+  - {symbol: ARM, name: Arm, type: stock}
+  - {symbol: SMCI, name: Super Micro Computer, type: stock}
+  - {symbol: COIN, name: Coinbase, type: stock}
+  - {symbol: MSTR, name: Strategy, type: stock}
+  - {symbol: HOOD, name: Robinhood, type: stock}
+  - {symbol: SOFI, name: SoFi, type: stock}
+  - {symbol: RDDT, name: Reddit, type: stock}
+  - {symbol: NFLX, name: Netflix, type: stock}
+  - {symbol: CRWD, name: CrowdStrike, type: stock}
+
+  # Major indices
+  - {symbol: ^NDX, name: NASDAQ 100, type: index}
+  - {symbol: ^GSPC, name: S&P 500, type: index}
+  - {symbol: ^DJI, name: Dow Jones, type: index}
+  - {symbol: ^FTSE, name: FTSE 100, type: index}
+  - {symbol: ^GDAXI, name: DAX, type: index}
+
+  # Forex
+  - {symbol: GBPUSD=X, name: GBP/USD, type: forex}
+  - {symbol: EURUSD=X, name: EUR/USD, type: forex}
+  - {symbol: USDJPY=X, name: USD/JPY, type: forex}
+  - {symbol: EURGBP=X, name: EUR/GBP, type: forex}
+  - {symbol: GBPJPY=X, name: GBP/JPY, type: forex}
