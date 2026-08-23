@@ -4,8 +4,8 @@ scanner:
   max_candle_age_minutes: 20
 
 risk:
-  account_cash_gbp: 1000
-  risk_per_trade_pct: 1.00   # ~£10 planned loss per trade
+  account_cash_gbp: 991.46
+  risk_per_trade_pct: 2.00   # ~£20 planned loss per trade
   max_cash_exposure_pct: 50
   atr_stop_multiple: 1.20
   tp1_r_multiple: 1.50
