@@ -1,0 +1,62 @@
+scanner:
+  minimum_score: 6.0
+  cooldown_minutes: 30
+  max_candle_age_minutes: 20
+  index_max_candle_age_minutes: 30
+  twelvedata_max_candle_age_minutes: 15
+
+  # Free Twelve Data plan protection:
+  # 5 FX/metals symbols x 12 scans/hour x 11 hours = ~660 credits/day (under 800/day).
+  twelvedata_active_start_hour_uk: 7
+  twelvedata_active_end_hour_uk: 18
+  twelvedata_sunday_start_hour_uk: 22
+
+risk:
+  account_cash_gbp: 991.46
+  risk_per_trade_pct: 2.00   # ~£19.83 planned loss per trade
+  max_cash_exposure_pct: 50
+  atr_stop_multiple: 1.20
+  tp1_r_multiple: 1.50
+  tp2_r_multiple: 2.50
+
+notifications:
+  macos: false
+  telegram: true
+
+watchlist:
+  # US stocks — Yahoo 5-minute data
+  - {symbol: NVDA, name: NVIDIA, type: stock}
+  - {symbol: TSLA, name: Tesla, type: stock}
+  - {symbol: PLTR, name: Palantir, type: stock}
+  - {symbol: AMD, name: AMD, type: stock}
+  - {symbol: META, name: Meta, type: stock}
+  - {symbol: AMZN, name: Amazon, type: stock}
+  - {symbol: AAPL, name: Apple, type: stock}
+  - {symbol: MSFT, name: Microsoft, type: stock}
+  - {symbol: GOOGL, name: Alphabet, type: stock}
+  - {symbol: AVGO, name: Broadcom, type: stock}
+  - {symbol: MU, name: Micron, type: stock}
+  - {symbol: ARM, name: Arm, type: stock}
+  - {symbol: SMCI, name: Super Micro Computer, type: stock}
+  - {symbol: COIN, name: Coinbase, type: stock}
+  - {symbol: MSTR, name: Strategy, type: stock}
+  - {symbol: HOOD, name: Robinhood, type: stock}
+  - {symbol: SOFI, name: SoFi, type: stock}
+  - {symbol: RDDT, name: Reddit, type: stock}
+  - {symbol: NFLX, name: Netflix, type: stock}
+  - {symbol: CRWD, name: CrowdStrike, type: stock}
+
+  # Cash indices — Yahoo during their cash sessions
+  - {symbol: ^NDX, name: NASDAQ 100, type: index}
+  - {symbol: ^GSPC, name: S&P 500, type: index}
+  - {symbol: ^DJI, name: Dow Jones, type: index}
+  - {symbol: ^FTSE, name: FTSE 100, type: index}
+  - {symbol: ^GDAXI, name: DAX, type: index}
+
+  # Reliable FX + spot metals — Twelve Data 5-minute feed.
+  # Kept to 5 symbols so the free 800-credit/day plan covers the main UK day-trading window.
+  - {symbol: GBPUSD, data_symbol: GBP/USD, name: GBP/USD, type: forex, provider: twelvedata}
+  - {symbol: EURUSD, data_symbol: EUR/USD, name: EUR/USD, type: forex, provider: twelvedata}
+  - {symbol: USDJPY, data_symbol: USD/JPY, name: USD/JPY, type: forex, provider: twelvedata}
+  - {symbol: XAUUSD, data_symbol: XAU/USD, name: Gold XAU/USD, type: metal, provider: twelvedata}
+  - {symbol: XAGUSD, data_symbol: XAG/USD, name: Silver XAG/USD, type: metal, provider: twelvedata}
