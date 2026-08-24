@@ -435,12 +435,22 @@ class IGDemoExecutor:
         return data
 
     @staticmethod
-    def _rule_points(rule, reference_price):
+    def _rule_points(rule, reference_price, scaling_factor=None):
         if not isinstance(rule, dict):
             return 0.0
         value = _safe_float(rule.get('value'), 0.0) or 0.0
-        if str(rule.get('unit') or '').upper() == 'PERCENTAGE':
+        unit = str(rule.get('unit') or '').upper()
+        if unit == 'PERCENTAGE':
             return abs(reference_price) * value / 100.0
+        if unit == 'POINTS':
+            # IG reports minNormalStopOrLimitDistance (and similar rules) in
+            # IG-internal "points", not raw price distance. scalingFactor
+            # converts IG's points to the instrument's raw price units
+            # (e.g. GBP/USD scalingFactor ~10000 means 4 points == 0.0004).
+            scale = _safe_float(scaling_factor, 0.0) or 0.0
+            if scale > 0:
+                return value / scale
+            return value
         return value
 
     @staticmethod
@@ -555,9 +565,16 @@ class IGDemoExecutor:
             )
             return False, 'outside entry zone'
 
+        pip_value = _number_from_text(instrument.get('valueOfOnePip'))
+        scaling = _safe_float(snapshot.get('scalingFactor'), _safe_float(market.get('scalingFactor')))
+        if pip_value is None or scaling is None or pip_value <= 0 or scaling <= 0:
+            telegram_notify(f'⚠️ IG DEMO AUTO: risk metadata unavailable for {sig.label}; skipped rather than guess size.')
+            return False, 'risk metadata unavailable'
+
         stop_distance = original_risk_distance
         limit_distance = abs(float(sig.tp1) - float(sig.price))
-        min_dist = self._rule_points(rules.get('minNormalStopOrLimitDistance'), ig_entry)
+        min_dist_points = _safe_float((rules.get('minNormalStopOrLimitDistance') or {}).get('value'), 0.0) or 0.0
+        min_dist = self._rule_points(rules.get('minNormalStopOrLimitDistance'), ig_entry, scaling)
         if min_dist > 0:
             stop_distance = max(stop_distance, min_dist * 1.05)
             limit_distance = max(limit_distance, min_dist * 1.05)
@@ -595,12 +612,6 @@ class IGDemoExecutor:
                 )
                 return False, 'conversion unavailable'
 
-        pip_value = _number_from_text(instrument.get('valueOfOnePip'))
-        scaling = _safe_float(snapshot.get('scalingFactor'), _safe_float(market.get('scalingFactor')))
-        if pip_value is None or scaling is None or pip_value <= 0 or scaling <= 0:
-            telegram_notify(f'⚠️ IG DEMO AUTO: risk metadata unavailable for {sig.label}; skipped rather than guess size.')
-            return False, 'risk metadata unavailable'
-
         risk_per_size_deal = stop_distance * scaling * pip_value
         risk_per_size_gbp = risk_per_size_deal * to_account_rate
         target_risk = float(sig.risk_gbp)
@@ -612,6 +623,22 @@ class IGDemoExecutor:
         if size < min_size:
             size = min_size
         estimated_risk = size * risk_per_size_gbp
+
+        print(
+            f'IG demo sizing {sig.label}: '
+            f'original_risk_distance={original_risk_distance:.6f} | '
+            f'ig_min_stop_points={min_dist_points:.4f} | '
+            f'ig_min_stop_converted={min_dist:.6f} | '
+            f'scalingFactor={scaling:.4f} | '
+            f'pip_value={pip_value:.6f} | '
+            f'minDealSize={min_size:.6f} | '
+            f'risk_per_size_gbp={risk_per_size_gbp:.6f} | '
+            f'raw_size={raw_size:.6f} | '
+            f'final_size={size:.6f} | '
+            f'estimated_risk_gbp={estimated_risk:.4f} | '
+            f'target_risk_gbp={target_risk:.4f}'
+        )
+
         if size <= 0:
             return False, 'size <= 0'
         if estimated_risk > target_risk * 1.25:
