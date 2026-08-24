@@ -5,7 +5,7 @@ import json
 import math
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -39,6 +39,7 @@ class Signal:
     risk_gbp: float
     suggested_exposure_gbp: float | None
     timestamp: str
+    context: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -57,6 +58,7 @@ class Candidate:
     recent_high: float
     reason: str
     armed_at: float
+    context: dict = field(default_factory=dict)
 
 
 
@@ -635,6 +637,14 @@ class IGDemoExecutor:
         ig_entry = offer if sig.side == 'LONG' else bid
         original_risk_distance = abs(float(sig.price) - float(sig.stop))
         spread = abs(offer - bid)
+        spread_r_fraction = spread / max(original_risk_distance, 1e-12)
+        max_spread_r_fraction = float(cfg.get('scanner', {}).get('max_spread_r_fraction', 0.20))
+        if spread_r_fraction > max_spread_r_fraction:
+            telegram_notify(
+                f'⏸ IG DEMO AUTO — {sig.label}\nSpread consumes ~{spread_r_fraction*100:.0f}% of planned 1R; ' 
+                f'above {max_spread_r_fraction*100:.0f}% limit. No order placed.'
+            )
+            return False, 'spread too large versus stop'
         zone_buffer = max(0.05 * original_risk_distance, spread * 2.0)
         zone_low = float(sig.entry_low) - zone_buffer
         zone_high = float(sig.entry_high) + zone_buffer
@@ -839,6 +849,8 @@ class IGDemoExecutor:
             'risk_budget_gbp': target_risk,
             'deal_currency': deal_currency,
             'deal_to_account_rate': to_account_rate,
+            'spread_r_fraction': spread_r_fraction,
+            'decision_context': dict(getattr(sig, 'context', {}) or {}),
         }
         self._record(rec)
         dec = decimals_for_price(fill_level)
@@ -1250,99 +1262,284 @@ def make_entry_zone(entry_price, stop_price, cfg):
     return float(entry_price - half), float(entry_price + half)
 
 
-def score_signal(df, item, cfg):
+def _resample_ohlc(df, rule):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    agg = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
+    if 'Volume' in d.columns:
+        agg['Volume'] = 'sum'
+    try:
+        out = d.resample(rule, label='right', closed='right').agg(agg)
+    except Exception:
+        return pd.DataFrame()
+    return out.dropna(subset=['Open', 'High', 'Low', 'Close'])
+
+
+def _regime_from_frame(frame, timeframe):
+    """Classify price regime with deliberately low-correlation evidence.
+
+    Uses only price/ATR/EMA slope so it works for Yahoo and Twelve Data without
+    extra API calls or dependencies. 1h can be built from the 5m cache even on
+    the smaller Twelve Data history, so its thresholds adapt to sample length.
+    """
+    if frame is None or len(frame) < 6:
+        return {'name': 'UNKNOWN', 'strength': 0.0, 'slope_atr': 0.0, 'sep_atr': 0.0}
+    d = frame.copy()
+    n = len(d)
+    if timeframe == '1h' and n < 16:
+        fast_n, mid_n, slow_n = 3, 6, min(9, max(7, n - 1))
+    else:
+        fast_n, mid_n, slow_n = 5, 13, 21
+    d['FAST'] = ema(d['Close'], fast_n)
+    d['MID'] = ema(d['Close'], mid_n)
+    d['SLOW'] = ema(d['Close'], slow_n)
+    atr_n = min(14, max(3, n // 3))
+    d['ATR_R'] = atr(d, atr_n)
+    row = d.iloc[-1]
+    atr_v = float(row['ATR_R']) if pd.notna(row['ATR_R']) and row['ATR_R'] > 0 else float((d['High'] - d['Low']).tail(6).mean())
+    if not np.isfinite(atr_v) or atr_v <= 0:
+        return {'name': 'UNKNOWN', 'strength': 0.0, 'slope_atr': 0.0, 'sep_atr': 0.0}
+    lookback = min(3, n - 1)
+    mid_prev = float(d['MID'].iloc[-1-lookback])
+    mid_now = float(row['MID'])
+    slope_atr = (mid_now - mid_prev) / atr_v / max(1, lookback)
+    sep_atr = (float(row['FAST']) - float(row['MID'])) / atr_v
+    close_rel = (float(row['Close']) - mid_now) / atr_v
+    bull = float(row['FAST']) > float(row['MID']) and mid_now >= float(row['SLOW']) and slope_atr > 0.025 and close_rel > -0.10
+    bear = float(row['FAST']) < float(row['MID']) and mid_now <= float(row['SLOW']) and slope_atr < -0.025 and close_rel < 0.10
+    strength = min(1.0, 0.45 * min(1.0, abs(slope_atr) / 0.12) + 0.35 * min(1.0, abs(sep_atr) / 0.45) + 0.20 * min(1.0, abs(close_rel) / 0.75))
+    if bull:
+        name = 'TREND_UP'
+    elif bear:
+        name = 'TREND_DOWN'
+    else:
+        name = 'RANGE_CHOP'
+        strength = min(strength, 0.55)
+    return {'name': name, 'strength': float(strength), 'slope_atr': float(slope_atr), 'sep_atr': float(sep_atr)}
+
+
+def _session_bucket(ts=None):
+    try:
+        t = pd.Timestamp(ts) if ts is not None else pd.Timestamp.now(tz='UTC')
+        if t.tzinfo is None:
+            t = t.tz_localize('UTC')
+        local = t.tz_convert(UK)
+        mins = local.hour * 60 + local.minute
+    except Exception:
+        mins = datetime.now(UK).hour * 60 + datetime.now(UK).minute
+    if 7*60 <= mins < 9*60:
+        return 'EUROPE_OPEN'
+    if 9*60 <= mins < 11*60+30:
+        return 'EUROPE_MORNING'
+    if 11*60+30 <= mins < 13*60+30:
+        return 'LUNCH'
+    if 13*60+30 <= mins < 16*60+30:
+        return 'NY_OVERLAP'
+    return 'OTHER'
+
+
+def _swing_levels(d, lookback=36):
+    x = d.tail(lookback).copy()
+    if len(x) < 7:
+        return [], []
+    highs = x['High'].astype(float).values
+    lows = x['Low'].astype(float).values
+    sh, sl = [], []
+    for i in range(2, len(x)-2):
+        if highs[i] >= max(highs[i-2:i]) and highs[i] > max(highs[i+1:i+3]):
+            sh.append(float(highs[i]))
+        if lows[i] <= min(lows[i-2:i]) and lows[i] < min(lows[i+1:i+3]):
+            sl.append(float(lows[i]))
+    return sh, sl
+
+
+def _atr_percentile(d, current_atr):
+    vals = atr(d, 14).dropna().tail(60).astype(float)
+    if len(vals) < 10 or not np.isfinite(current_atr):
+        return 50.0
+    return float((vals <= current_atr).mean() * 100.0)
+
+
+def _decision_snapshot(df, item, cfg):
+    """Return independent Decision Engine v2 components for LONG and SHORT."""
+    if df is None or len(df) < 65:
+        return None
     d = df.copy()
     d['EMA9'] = ema(d['Close'], 9)
     d['EMA20'] = ema(d['Close'], 20)
     d['EMA50'] = ema(d['Close'], 50)
     d['RSI'] = rsi(d['Close'], 14)
     d['ATR'] = atr(d, 14)
-    d['VWAP'] = session_vwap(d)
-    d['HH20'] = d['High'].shift(1).rolling(20).max()
-    d['LL20'] = d['Low'].shift(1).rolling(20).min()
-
-    has_volume = 'Volume' in d.columns and pd.to_numeric(d['Volume'], errors='coerce').fillna(0).sum() > 0
-    if has_volume:
-        d['VOLAVG20'] = d['Volume'].rolling(20).mean()
-        d['RVOL'] = d['Volume'] / d['VOLAVG20'].replace(0, np.nan)
-    else:
-        d['RVOL'] = np.nan
-
-    # The newest row can be the currently-forming bar. Score the last completed bar.
     row = d.iloc[-2]
     prev = d.iloc[-3]
     live = d.iloc[-1]
     if pd.isna(row['ATR']) or row['ATR'] <= 0 or pd.isna(row['RSI']):
         return None
 
-    trigger_close = float(row['Close'])
-    live_price = float(live['Close'])
-    atr_v = float(row['ATR'])
-    market_type = item.get('type', 'stock')
+    completed = d.iloc[:-1].copy()
+    tf15 = _resample_ohlc(completed, '15min')
+    tf1h = _resample_ohlc(completed, '1h')
+    reg15 = _regime_from_frame(tf15, '15m')
+    reg1h = _regime_from_frame(tf1h, '1h')
+
+    close = float(row['Close']); op = float(row['Open']); high = float(row['High']); low = float(row['Low'])
+    prev_high = float(prev['High']); prev_low = float(prev['Low']); prev_close = float(prev['Close'])
+    live_price = float(live['Close']); atr_v = float(row['ATR'])
+    candle_range = max(high - low, 1e-12)
+    body = abs(close - op)
+    body_ratio = body / candle_range
+    close_pos = (close - low) / candle_range
+    atr_pct = _atr_percentile(completed, atr_v)
+
+    hist = completed.iloc[:-1].tail(40)
+    sh, sl = _swing_levels(hist, 36)
+    resistance = [x for x in sh if x > close]
+    support = [x for x in sl if x < close]
+    nearest_res = min(resistance) if resistance else None
+    nearest_sup = max(support) if support else None
+    res_dist_atr = ((nearest_res - close) / atr_v) if nearest_res is not None else 99.0
+    sup_dist_atr = ((close - nearest_sup) / atr_v) if nearest_sup is not None else 99.0
+    prior_high20 = float(hist['High'].tail(20).max()) if not hist.empty else prev_high
+    prior_low20 = float(hist['Low'].tail(20).min()) if not hist.empty else prev_low
+    midpoint = (prior_high20 + prior_low20) / 2.0
+
+    ema_sep = abs(float(row['EMA20']) - float(row['EMA50'])) / atr_v
+    ema_slope = (float(row['EMA20']) - float(d['EMA20'].iloc[-6])) / atr_v / 4.0
+    trend_strength = min(1.0, 0.55 * min(1.0, ema_sep / 0.55) + 0.45 * min(1.0, abs(ema_slope) / 0.12))
+    vol_ok = 12.0 <= atr_pct <= 97.5
+    vol_extreme = atr_pct > 99.0
+
+    results = {}
+    for side in ('LONG', 'SHORT'):
+        long = side == 'LONG'
+        opposite15 = reg15['name'] == ('TREND_DOWN' if long else 'TREND_UP') and reg15['strength'] >= 0.50
+        strong_opposite1h = reg1h['name'] == ('TREND_DOWN' if long else 'TREND_UP') and reg1h['strength'] >= 0.78
+        veto = bool(opposite15 or strong_opposite1h or vol_extreme)
+        veto_reasons = []
+        if opposite15: veto_reasons.append('15m regime opposite')
+        if strong_opposite1h: veto_reasons.append('1h strongly opposite')
+        if vol_extreme: veto_reasons.append('extreme volatility')
+
+        same15 = reg15['name'] == ('TREND_UP' if long else 'TREND_DOWN')
+        same1h = reg1h['name'] == ('TREND_UP' if long else 'TREND_DOWN')
+        htf = 0.0
+        if same15:
+            htf += 1.25 + (0.25 if reg15['strength'] >= 0.70 else 0.0)
+        elif reg15['name'] == 'RANGE_CHOP':
+            htf += 0.5
+        if same1h:
+            htf += 0.5
+        elif reg1h['name'] == 'RANGE_CHOP' or reg1h['name'] == 'UNKNOWN':
+            htf += 0.25
+        htf = min(2.0, htf)
+
+        if long:
+            directional_structure = close > midpoint and float(row['EMA20']) >= float(row['EMA50'])
+            clean_break = close > prior_high20
+            room = res_dist_atr
+            into_level = (nearest_res is not None and res_dist_atr < 0.35 and not clean_break)
+        else:
+            directional_structure = close < midpoint and float(row['EMA20']) <= float(row['EMA50'])
+            clean_break = close < prior_low20
+            room = sup_dist_atr
+            into_level = (nearest_sup is not None and sup_dist_atr < 0.35 and not clean_break)
+        structure = (1.0 if directional_structure else 0.0) + (1.0 if clean_break or room >= 0.75 else 0.0)
+        if into_level:
+            structure = min(structure, 0.5)
+            veto_reasons.append('breakout into nearby structure')
+            if room < 0.20:
+                veto = True
+
+        tv = 0.0
+        aligned_slope = ema_slope > 0.025 if long else ema_slope < -0.025
+        if vol_ok and aligned_slope and trend_strength >= 0.30:
+            tv = 1.0
+        elif vol_ok and (aligned_slope or trend_strength >= 0.25):
+            tv = 0.5
+
+        if long:
+            breakout = close > prev_high
+            directional_candle = close > op and close_pos >= 0.62
+        else:
+            breakout = close < prev_low
+            directional_candle = close < op and close_pos <= 0.38
+        setup5 = 1.0 if breakout and directional_candle and body_ratio >= 0.45 else (0.5 if directional_candle and body_ratio >= 0.30 else 0.0)
+
+        rsi_v = float(row['RSI'])
+        if long:
+            rsi_ok = 52 <= rsi_v <= 69
+            price_mom = close > prev_close and close > float(row['EMA9'])
+            exhausted = rsi_v > 76 or (close - float(row['EMA20'])) > 1.25 * atr_v
+        else:
+            rsi_ok = 31 <= rsi_v <= 48
+            price_mom = close < prev_close and close < float(row['EMA9'])
+            exhausted = rsi_v < 24 or (float(row['EMA20']) - close) > 1.25 * atr_v
+        momentum = 1.0 if rsi_ok and price_mom and not exhausted else (0.5 if (rsi_ok or price_mom) and not exhausted else 0.0)
+        if exhausted:
+            veto_reasons.append('momentum exhausted')
+
+        score = htf + structure + tv + setup5 + momentum  # max 7 before 1m execution
+        components = {
+            'htf_regime': round(htf, 2),
+            'structure_location': round(structure, 2),
+            'trend_volatility': round(tv, 2),
+            'setup_5m': round(setup5, 2),
+            'momentum_quality': round(momentum, 2),
+            'trigger_1m': 0.0,
+        }
+        results[side] = {
+            'score': float(score), 'veto': veto, 'veto_reasons': veto_reasons,
+            'components': components, 'breakout': bool(breakout), 'directional_candle': bool(directional_candle),
+        }
+
+    context = {
+        'engine': 'v2',
+        'session': _session_bucket(row.name),
+        'regime_15m': reg15['name'], 'regime_15m_strength': round(reg15['strength'], 3),
+        'regime_1h': reg1h['name'], 'regime_1h_strength': round(reg1h['strength'], 3),
+        'atr_value': atr_v, 'atr_percentile': round(atr_pct, 1),
+        'trend_strength': round(trend_strength, 3),
+        'nearest_resistance_atr': round(float(res_dist_atr), 3),
+        'nearest_support_atr': round(float(sup_dist_atr), 3),
+        'candle_body_ratio': round(float(body_ratio), 3),
+        'live_price': live_price,
+    }
+    return {'d': d, 'row': row, 'prev': prev, 'live': live, 'atr': atr_v, 'close': close, 'live_price': live_price,
+            'results': results, 'context': context}
+
+
+def _v2_reason(side_result, context):
+    c = side_result['components']
+    return (
+        f"HTF {context['regime_15m']}/{context['regime_1h']} {c['htf_regime']:.1f}/2, "
+        f"structure {c['structure_location']:.1f}/2, trend/vol {c['trend_volatility']:.1f}/1, "
+        f"5m {c['setup_5m']:.1f}/1, momentum {c['momentum_quality']:.1f}/1"
+    )
+
+
+def score_signal(df, item, cfg):
+    snap = _decision_snapshot(df, item, cfg)
+    if not snap:
+        return None
+    row, prev = snap['row'], snap['prev']
+    live_price, atr_v = snap['live_price'], snap['atr']
     min_score = float(cfg['scanner']['minimum_score'])
-
-    # Avoid chasing if price has already moved too far after the confirmation candle.
-    if abs(live_price - trigger_close) > 0.75 * atr_v:
+    direct_min_score = min_score + (0.5 if item.get('type', 'stock') in ('forex','index','metal') else 0.0)
+    candidates = []
+    for side in ('LONG', 'SHORT'):
+        r = snap['results'][side]
+        if not r['veto'] and r['breakout'] and r['directional_candle'] and r['score'] >= direct_min_score:
+            candidates.append((r['score'], side, r))
+    if not candidates:
         return None
+    _, side, side_result = max(candidates, key=lambda x: x[0])
 
-    long_score = 0.0
-    long_reasons = []
-    if row['EMA9'] > row['EMA20'] > row['EMA50']:
-        long_score += 2.0; long_reasons.append('EMA trend up')
-    elif row['EMA9'] > row['EMA20']:
-        long_score += 1.0; long_reasons.append('short trend up')
-    if 55 <= row['RSI'] <= 72:
-        long_score += 1.0; long_reasons.append(f"RSI {row['RSI']:.0f}")
-    if trigger_close > row['HH20']:
-        long_score += 2.0; long_reasons.append('20-bar breakout')
-    elif trigger_close > prev['High']:
-        long_score += 1.0; long_reasons.append('5m high break')
-    if has_volume and not pd.isna(row['VWAP']) and trigger_close > row['VWAP']:
-        long_score += 1.0; long_reasons.append('above VWAP')
-    if has_volume and not pd.isna(row['RVOL']) and row['RVOL'] >= 1.5:
-        long_score += 1.5; long_reasons.append(f"RVOL {row['RVOL']:.1f}x")
-    if not has_volume and market_type in ('forex', 'metal', 'index'):
-        if row['EMA20'] > row['EMA50'] and row['EMA20'] > d['EMA20'].iloc[-5]:
-            long_score += 1.0; long_reasons.append('trend slope up')
-    if trigger_close > prev['Close'] and (trigger_close - prev['Close']) > 0.20 * atr_v:
-        long_score += 0.5; long_reasons.append('momentum')
-
-    short_score = 0.0
-    short_reasons = []
-    if row['EMA9'] < row['EMA20'] < row['EMA50']:
-        short_score += 2.0; short_reasons.append('EMA trend down')
-    elif row['EMA9'] < row['EMA20']:
-        short_score += 1.0; short_reasons.append('short trend down')
-    if 28 <= row['RSI'] <= 45:
-        short_score += 1.0; short_reasons.append(f"RSI {row['RSI']:.0f}")
-    if trigger_close < row['LL20']:
-        short_score += 2.0; short_reasons.append('20-bar breakdown')
-    elif trigger_close < prev['Low']:
-        short_score += 1.0; short_reasons.append('5m low break')
-    if has_volume and not pd.isna(row['VWAP']) and trigger_close < row['VWAP']:
-        short_score += 1.0; short_reasons.append('below VWAP')
-    if has_volume and not pd.isna(row['RVOL']) and row['RVOL'] >= 1.5:
-        short_score += 1.5; short_reasons.append(f"RVOL {row['RVOL']:.1f}x")
-    if not has_volume and market_type in ('forex', 'metal', 'index'):
-        if row['EMA20'] < row['EMA50'] and row['EMA20'] < d['EMA20'].iloc[-5]:
-            short_score += 1.0; short_reasons.append('trend slope down')
-    if trigger_close < prev['Close'] and (prev['Close'] - trigger_close) > 0.20 * atr_v:
-        short_score += 0.5; short_reasons.append('momentum')
-
-    # A signal now requires an actual completed 5-minute trigger, not indicators alone.
-    long_trigger = trigger_close > prev['High'] and trigger_close > row['Open']
-    short_trigger = trigger_close < prev['Low'] and trigger_close < row['Open']
-
-    score = max(long_score, short_score)
-    if score < min_score:
+    # Decision Engine v2 deliberately chases less than v1.
+    trigger_close = float(row['Close'])
+    if abs(live_price - trigger_close) > 0.45 * atr_v:
         return None
-    if long_score > short_score and long_trigger:
-        side = 'LONG'; reasons = long_reasons
-    elif short_score > long_score and short_trigger:
-        side = 'SHORT'; reasons = short_reasons
-    else:
-        return None
-
+    d = snap['d']
     recent_low = float(d['Low'].iloc[-10:-1].min())
     recent_high = float(d['High'].iloc[-10:-1].max())
     stop_mult = float(cfg['risk']['atr_stop_multiple'])
@@ -1350,156 +1547,69 @@ def score_signal(df, item, cfg):
     if side == 'LONG':
         stop = min(trigger_close - stop_mult * atr_v, recent_low - 0.10 * atr_v)
         risk_per_unit = price - stop
-        if risk_per_unit <= 0:
-            return None
+        if risk_per_unit <= 0: return None
         tp1 = price + float(cfg['risk']['tp1_r_multiple']) * risk_per_unit
         tp2 = price + float(cfg['risk']['tp2_r_multiple']) * risk_per_unit
     else:
         stop = max(trigger_close + stop_mult * atr_v, recent_high + 0.10 * atr_v)
         risk_per_unit = stop - price
-        if risk_per_unit <= 0:
-            return None
+        if risk_per_unit <= 0: return None
         tp1 = price - float(cfg['risk']['tp1_r_multiple']) * risk_per_unit
         tp2 = price - float(cfg['risk']['tp2_r_multiple']) * risk_per_unit
 
     account = float(cfg['risk']['account_cash_gbp'])
-    risk_pct = float(cfg['risk']['risk_per_trade_pct']) / 100.0
-    risk_gbp = account * risk_pct
+    risk_gbp = account * float(cfg['risk']['risk_per_trade_pct']) / 100.0
     stop_pct = risk_per_unit / price
     max_exposure = account * float(cfg['risk']['max_cash_exposure_pct']) / 100.0
     suggested = min(max_exposure, risk_gbp / stop_pct) if stop_pct > 0 else None
-
     entry_low, entry_high = make_entry_zone(price, stop, cfg)
-    now = datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')
+    context = dict(snap['context'])
+    context['score_components'] = dict(side_result['components'])
+    context['veto_reasons'] = list(side_result['veto_reasons'])
     return Signal(
-        symbol=item['symbol'], label=item.get('name', item['symbol']), market_type=market_type,
-        side=side, price=price, stop=float(stop), tp1=float(tp1), tp2=float(tp2),
-        entry_low=entry_low, entry_high=entry_high,
-        score=float(score), reason=', '.join(reasons[:5]), risk_gbp=float(risk_gbp),
-        suggested_exposure_gbp=float(suggested) if suggested else None, timestamp=now,
+        symbol=item['symbol'], label=item.get('name', item['symbol']), market_type=item.get('type', 'stock'),
+        side=side, price=float(price), stop=float(stop), tp1=float(tp1), tp2=float(tp2),
+        entry_low=entry_low, entry_high=entry_high, score=float(side_result['score']),
+        reason=_v2_reason(side_result, context), risk_gbp=float(risk_gbp),
+        suggested_exposure_gbp=float(suggested) if suggested else None,
+        timestamp=datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds'), context=context,
     )
 
 
 def candidate_from_5m(df, item, cfg):
-    """Arm a 1-minute watcher only when a 5-minute setup is genuinely close.
-
-    The core strategy remains 5-minute. This function looks for a directional
-    setup within roughly 1 score point of the normal threshold and near the
-    last completed 5-minute high/low. The 1-minute watcher then waits for a
-    closed 1-minute breakout/breakdown before alerting.
-    """
-    d = df.copy()
-    d['EMA9'] = ema(d['Close'], 9)
-    d['EMA20'] = ema(d['Close'], 20)
-    d['EMA50'] = ema(d['Close'], 50)
-    d['RSI'] = rsi(d['Close'], 14)
-    d['ATR'] = atr(d, 14)
-    d['VWAP'] = session_vwap(d)
-    d['HH20'] = d['High'].shift(1).rolling(20).max()
-    d['LL20'] = d['Low'].shift(1).rolling(20).min()
-
-    has_volume = 'Volume' in d.columns and pd.to_numeric(d['Volume'], errors='coerce').fillna(0).sum() > 0
-    if has_volume:
-        d['VOLAVG20'] = d['Volume'].rolling(20).mean()
-        d['RVOL'] = d['Volume'] / d['VOLAVG20'].replace(0, np.nan)
-    else:
-        d['RVOL'] = np.nan
-
-    row = d.iloc[-2]
-    prev = d.iloc[-3]
-    live = d.iloc[-1]
-    if pd.isna(row['ATR']) or row['ATR'] <= 0 or pd.isna(row['RSI']):
+    snap = _decision_snapshot(df, item, cfg)
+    if not snap:
         return None
-
-    close = float(row['Close'])
-    live_price = float(live['Close'])
-    atr_v = float(row['ATR'])
-    market_type = item.get('type', 'stock')
     min_score = float(cfg['scanner']['minimum_score'])
     gap = float(cfg.get('scanner', {}).get('entry_watch_near_score_gap', 1.0))
     near_threshold = max(0.0, min_score - gap)
+    live_price, atr_v = snap['live_price'], snap['atr']
+    row = snap['row']
 
-    long_score = 0.0
-    long_reasons = []
-    if row['EMA9'] > row['EMA20'] > row['EMA50']:
-        long_score += 2.0; long_reasons.append('EMA trend up')
-    elif row['EMA9'] > row['EMA20']:
-        long_score += 1.0; long_reasons.append('short trend up')
-    if 55 <= row['RSI'] <= 72:
-        long_score += 1.0; long_reasons.append(f"RSI {row['RSI']:.0f}")
-    if close > row['HH20']:
-        long_score += 2.0; long_reasons.append('20-bar breakout')
-    elif close > prev['High']:
-        long_score += 1.0; long_reasons.append('5m high break')
-    if has_volume and not pd.isna(row['VWAP']) and close > row['VWAP']:
-        long_score += 1.0; long_reasons.append('above VWAP')
-    if has_volume and not pd.isna(row['RVOL']) and row['RVOL'] >= 1.5:
-        long_score += 1.5; long_reasons.append(f"RVOL {row['RVOL']:.1f}x")
-    if not has_volume and market_type in ('forex', 'metal', 'index'):
-        if row['EMA20'] > row['EMA50'] and row['EMA20'] > d['EMA20'].iloc[-5]:
-            long_score += 1.0; long_reasons.append('trend slope up')
-    if close > prev['Close'] and (close - prev['Close']) > 0.20 * atr_v:
-        long_score += 0.5; long_reasons.append('momentum')
-
-    short_score = 0.0
-    short_reasons = []
-    if row['EMA9'] < row['EMA20'] < row['EMA50']:
-        short_score += 2.0; short_reasons.append('EMA trend down')
-    elif row['EMA9'] < row['EMA20']:
-        short_score += 1.0; short_reasons.append('short trend down')
-    if 28 <= row['RSI'] <= 45:
-        short_score += 1.0; short_reasons.append(f"RSI {row['RSI']:.0f}")
-    if close < row['LL20']:
-        short_score += 2.0; short_reasons.append('20-bar breakdown')
-    elif close < prev['Low']:
-        short_score += 1.0; short_reasons.append('5m low break')
-    if has_volume and not pd.isna(row['VWAP']) and close < row['VWAP']:
-        short_score += 1.0; short_reasons.append('below VWAP')
-    if has_volume and not pd.isna(row['RVOL']) and row['RVOL'] >= 1.5:
-        short_score += 1.5; short_reasons.append(f"RVOL {row['RVOL']:.1f}x")
-    if not has_volume and market_type in ('forex', 'metal', 'index'):
-        if row['EMA20'] < row['EMA50'] and row['EMA20'] < d['EMA20'].iloc[-5]:
-            short_score += 1.0; short_reasons.append('trend slope down')
-    if close < prev['Close'] and (prev['Close'] - close) > 0.20 * atr_v:
-        short_score += 0.5; short_reasons.append('momentum')
-
-    if long_score == short_score:
+    choices = []
+    for side in ('LONG', 'SHORT'):
+        r = snap['results'][side]
+        if r['veto'] or r['score'] < near_threshold:
+            continue
+        trigger = float(row['High']) if side == 'LONG' else float(row['Low'])
+        distance = (trigger - live_price) if side == 'LONG' else (live_price - trigger)
+        if distance > 0.50 * atr_v or distance < -0.22 * atr_v:
+            continue
+        choices.append((r['score'], side, trigger, r))
+    if not choices:
         return None
-    if long_score > short_score:
-        side = 'LONG'; score = long_score; reasons = long_reasons
-        trigger = float(row['High'])
-        distance = trigger - live_price
-    else:
-        side = 'SHORT'; score = short_score; reasons = short_reasons
-        trigger = float(row['Low'])
-        distance = live_price - trigger
-
-    # Only arm setups close enough to matter and close enough in score that a
-    # breakout confirmation can realistically push them over the threshold.
-    if score < near_threshold:
-        return None
-    if distance > 0.60 * atr_v:
-        return None
-    if distance < -0.35 * atr_v:  # already ran too far through the trigger
-        return None
-
+    score, side, trigger, side_result = max(choices, key=lambda x: x[0])
+    d = snap['d']
+    context = dict(snap['context'])
+    context['score_components'] = dict(side_result['components'])
+    context['veto_reasons'] = list(side_result['veto_reasons'])
     return Candidate(
-        symbol=item['symbol'],
-        label=item.get('name', item['symbol']),
-        market_type=market_type,
-        provider=item.get('provider', 'yahoo'),
-        data_symbol=item.get('data_symbol', item['symbol']),
-        side=side,
-        score=float(score),
-        trigger_level=float(trigger),
-        atr_value=float(atr_v),
-        anchor_close=float(close),
-        recent_low=float(d['Low'].iloc[-10:-1].min()),
-        recent_high=float(d['High'].iloc[-10:-1].max()),
-        reason=', '.join(reasons[:5]),
-        armed_at=time.time(),
+        symbol=item['symbol'], label=item.get('name', item['symbol']), market_type=item.get('type', 'stock'),
+        provider=item.get('provider', 'yahoo'), data_symbol=item.get('data_symbol', item['symbol']), side=side,
+        score=float(score), trigger_level=float(trigger), atr_value=float(atr_v), anchor_close=float(snap['close']),
+        recent_low=float(d['Low'].iloc[-10:-1].min()), recent_high=float(d['High'].iloc[-10:-1].max()),
+        reason=_v2_reason(side_result, context), armed_at=time.time(), context=context,
     )
-
 
 def select_candidates(candidates, cfg):
     if not candidates:
@@ -1538,20 +1648,18 @@ def consume_td_watch_credit(state, cfg):
     return True, used + 1, budget
 
 
-def build_signal_from_candidate(c, entry_price, cfg):
+def build_signal_from_candidate(c, entry_price, cfg, trigger_meta=None):
     stop_mult = float(cfg['risk']['atr_stop_multiple'])
     if c.side == 'LONG':
         stop = min(c.anchor_close - stop_mult * c.atr_value, c.recent_low - 0.10 * c.atr_value)
         risk_per_unit = entry_price - stop
-        if risk_per_unit <= 0:
-            return None
+        if risk_per_unit <= 0: return None
         tp1 = entry_price + float(cfg['risk']['tp1_r_multiple']) * risk_per_unit
         tp2 = entry_price + float(cfg['risk']['tp2_r_multiple']) * risk_per_unit
     else:
         stop = max(c.anchor_close + stop_mult * c.atr_value, c.recent_high + 0.10 * c.atr_value)
         risk_per_unit = stop - entry_price
-        if risk_per_unit <= 0:
-            return None
+        if risk_per_unit <= 0: return None
         tp1 = entry_price - float(cfg['risk']['tp1_r_multiple']) * risk_per_unit
         tp2 = entry_price - float(cfg['risk']['tp2_r_multiple']) * risk_per_unit
 
@@ -1561,24 +1669,21 @@ def build_signal_from_candidate(c, entry_price, cfg):
     max_exposure = account * float(cfg['risk']['max_cash_exposure_pct']) / 100.0
     suggested = min(max_exposure, risk_gbp / stop_pct) if stop_pct > 0 else None
     entry_low, entry_high = make_entry_zone(entry_price, stop, cfg)
+    context = dict(c.context or {})
+    comps = dict(context.get('score_components') or {})
+    comps['trigger_1m'] = 1.0
+    context['score_components'] = comps
+    if trigger_meta:
+        context.update(trigger_meta)
+    mode = context.get('trigger_mode', 'confirmed')
     return Signal(
-        symbol=c.symbol,
-        label=c.label,
-        market_type=c.market_type,
-        side=c.side,
-        price=float(entry_price),
-        stop=float(stop),
-        tp1=float(tp1),
-        tp2=float(tp2),
-        entry_low=entry_low,
-        entry_high=entry_high,
+        symbol=c.symbol, label=c.label, market_type=c.market_type, side=c.side, price=float(entry_price),
+        stop=float(stop), tp1=float(tp1), tp2=float(tp2), entry_low=entry_low, entry_high=entry_high,
         score=float(min(8.0, c.score + 1.0)),
-        reason=(c.reason + ', 1m trigger confirmed').strip(', '),
-        risk_gbp=float(risk_gbp),
+        reason=(c.reason + f', 1m {mode} confirmed').strip(', '), risk_gbp=float(risk_gbp),
         suggested_exposure_gbp=float(suggested) if suggested else None,
-        timestamp=datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds'),
+        timestamp=datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds'), context=context,
     )
-
 
 def format_1m_signal(s: Signal):
     dec = decimals_for_price(s.price)
@@ -1622,9 +1727,7 @@ def watch_1m_entries(cfg, armed):
 
     for symbol, c in list(armed.items()):
         if now_ts - c.armed_at > ttl_min * 60:
-            remaining.pop(symbol, None)
-            continue
-
+            remaining.pop(symbol, None); continue
         try:
             if c.provider == 'twelvedata':
                 allowed, used, budget = consume_td_watch_credit(state, cfg)
@@ -1635,61 +1738,58 @@ def watch_1m_entries(cfg, armed):
                 print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m watcher TD credit {used}/{budget}')
             else:
                 df = fetch_yahoo_1m(c.data_symbol)
-            if df is None or len(df) < 3:
-                print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m watcher data unavailable')
-                continue
+            if df is None or len(df) < 4:
+                print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m watcher data unavailable'); continue
 
-            # Use the last completed 1-minute candle and require an actual cross.
-            bar = df.iloc[-2]
-            prev = df.iloc[-3]
-            live = df.iloc[-1]
-            close = float(bar['Close'])
-            prev_close = float(prev['Close'])
-            live_price = float(live['Close'])
-
+            bar = df.iloc[-2]; prev = df.iloc[-3]; live = df.iloc[-1]
+            close=float(bar['Close']); op=float(bar['Open']); high=float(bar['High']); low=float(bar['Low'])
+            prev_close=float(prev['Close']); prev_high=float(prev['High']); prev_low=float(prev['Low'])
+            live_price=float(live['Close']); rng=max(high-low, 1e-12); body=abs(close-op); body_ratio=body/rng
+            close_pos=(close-low)/rng
             if c.side == 'LONG':
-                crossed = prev_close <= c.trigger_level and close > c.trigger_level and close > float(bar['Open'])
-                too_far = live_price - c.trigger_level > 0.35 * c.atr_value
+                breakout_now = prev_close <= c.trigger_level and close > c.trigger_level
+                retest_hold = prev_close > c.trigger_level and low <= c.trigger_level + 0.05*c.atr_value and close > c.trigger_level
+                quality = close > op and body_ratio >= (0.45 if breakout_now else 0.32) and close_pos >= 0.68 and (high-max(op,close))/rng <= 0.28
+                too_far = live_price - c.trigger_level > 0.25 * c.atr_value
             else:
-                crossed = prev_close >= c.trigger_level and close < c.trigger_level and close < float(bar['Open'])
-                too_far = c.trigger_level - live_price > 0.35 * c.atr_value
+                breakout_now = prev_close >= c.trigger_level and close < c.trigger_level
+                retest_hold = prev_close < c.trigger_level and high >= c.trigger_level - 0.05*c.atr_value and close < c.trigger_level
+                quality = close < op and body_ratio >= (0.45 if breakout_now else 0.32) and close_pos <= 0.32 and (min(op,close)-low)/rng <= 0.28
+                too_far = c.trigger_level - live_price > 0.25 * c.atr_value
 
-            if not crossed:
-                print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m watcher armed {c.side} @ {c.trigger_level:.5f}; waiting')
+            triggered = breakout_now or retest_hold
+            if not triggered:
+                print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m watcher armed {c.side} @ {c.trigger_level:.5f}; waiting'); continue
+            if not quality:
+                print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m trigger touched but candle quality weak; keep waiting')
                 continue
             if too_far:
-                print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m trigger crossed but entry already stretched; skip')
-                remaining.pop(symbol, None)
-                continue
+                print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m trigger confirmed but entry stretched; skip')
+                remaining.pop(symbol, None); continue
 
-            sig = build_signal_from_candidate(c, live_price, cfg)
+            mode = 'retest_hold' if retest_hold and not breakout_now else 'breakout'
+            trigger_meta = {'trigger_mode': mode, 'trigger_body_ratio': round(float(body_ratio),3), 'trigger_close_position': round(float(close_pos),3)}
+            sig = build_signal_from_candidate(c, live_price, cfg, trigger_meta=trigger_meta)
             if not sig:
-                remaining.pop(symbol, None)
-                continue
+                remaining.pop(symbol, None); continue
 
-            sig_id = signature(sig)
-            key = f'{symbol}:{sig.side}'
-            last = state.get(key, {})
-            if (now_ts - last.get('time', 0)) < cooldown_min * 60 and last.get('signature') == sig_id:
+            sig_id = signature(sig); key=f'{symbol}:{sig.side}'; last=state.get(key,{})
+            if (now_ts-last.get('time',0)) < cooldown_min*60 and last.get('signature') == sig_id:
                 print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m trigger held; cooldown')
-                remaining.pop(symbol, None)
-                continue
+                remaining.pop(symbol,None); continue
 
-            text = format_1m_signal(sig)
-            print('\n' + text + '\n')
-            delivered = telegram_notify(text) if cfg.get('notifications', {}).get('telegram', True) else True
+            text=format_1m_signal(sig); print('\n'+text+'\n')
+            delivered=telegram_notify(text) if cfg.get('notifications',{}).get('telegram',True) else True
             if delivered:
-                state[key] = {'time': now_ts, 'signature': sig_id}
-                item = next((i for i in cfg.get('watchlist', []) if i.get('symbol') == sig.symbol), None)
-                register_tracked_signal(sig, item)
+                state[key]={'time':now_ts,'signature':sig_id}
+                item=next((i for i in cfg.get('watchlist',[]) if i.get('symbol')==sig.symbol),None)
+                register_tracked_signal(sig,item)
                 maybe_execute_ig_demo(sig, source='1m')
-                remaining.pop(symbol, None)
+                remaining.pop(symbol,None)
         except Exception as e:
             print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m watcher ERROR {e}')
-
     save_state(state)
     return remaining
-
 
 def decimals_for_price(x):
     if x >= 1000: return 1
@@ -1822,39 +1922,37 @@ def register_tracked_signal(sig: Signal, item=None):
     tid = track_id(sig)
     if any(r.get('id') == tid for r in data['signals']):
         return tid
+
+    # One theoretical thesis per symbol+direction at a time. This removes the
+    # repeated DAX/USDJPY bookkeeping distortion without changing real IG logic.
+    active_same = [r for r in data['signals'] if r.get('symbol') == sig.symbol and r.get('side') == sig.side and r.get('status') in {'OPEN','TP1_OPEN'}]
+    if active_same:
+        existing = active_same[-1]
+        print(f'[{datetime.now().strftime("%H:%M:%S")}] tracker: duplicate thesis suppressed {sig.symbol} {sig.side}; active #{existing.get("id","?")}')
+        return existing.get('id')
+
     provider = (item or {}).get('provider', 'yahoo')
     data_symbol = (item or {}).get('data_symbol', sig.symbol)
+    ctx = dict(getattr(sig, 'context', {}) or {})
     rec = {
-        'id': tid,
-        'symbol': sig.symbol,
-        'label': sig.label,
-        'market_type': sig.market_type,
-        'provider': provider,
-        'data_symbol': data_symbol,
-        'side': sig.side,
-        'entry': sig.price,
-        'entry_low': sig.entry_low,
-        'entry_high': sig.entry_high,
-        'stop': sig.stop,
-        'tp1': sig.tp1,
-        'tp2': sig.tp2,
-        'score': sig.score,
-        'risk_gbp': sig.risk_gbp,
-        'created_at': sig.timestamp,
-        'status': 'OPEN',
-        'last_checked_bar': None,
-        'tp1_hit_at': None,
-        'closed_at': None,
-        'result_r': 0.0,
-        'max_favorable_r': 0.0,
-        'reentry_armed_at': None,
-        'reentry_alerted_at': None,
+        'id': tid, 'symbol': sig.symbol, 'label': sig.label, 'market_type': sig.market_type,
+        'provider': provider, 'data_symbol': data_symbol, 'side': sig.side,
+        'entry': sig.price, 'entry_low': sig.entry_low, 'entry_high': sig.entry_high,
+        'stop': sig.stop, 'tp1': sig.tp1, 'tp2': sig.tp2, 'score': sig.score,
+        'risk_gbp': sig.risk_gbp, 'created_at': sig.timestamp, 'status': 'OPEN',
+        'last_checked_bar': None, 'tp1_hit_at': None, 'closed_at': None, 'result_r': 0.0,
+        'max_favorable_r': 0.0, 'max_adverse_r': 0.0,
+        'reentry_armed_at': None, 'reentry_alerted_at': None,
+        'decision_engine': ctx.get('engine','v1'), 'session': ctx.get('session'),
+        'regime_15m': ctx.get('regime_15m'), 'regime_1h': ctx.get('regime_1h'),
+        'atr_value': ctx.get('atr_value'), 'atr_percentile': ctx.get('atr_percentile'),
+        'trend_strength': ctx.get('trend_strength'), 'nearest_resistance_atr': ctx.get('nearest_resistance_atr'),
+        'nearest_support_atr': ctx.get('nearest_support_atr'), 'score_components': ctx.get('score_components'),
+        'trigger_mode': ctx.get('trigger_mode'), 'trigger_body_ratio': ctx.get('trigger_body_ratio'),
     }
-    data['signals'].append(rec)
-    save_tracker(data)
+    data['signals'].append(rec); save_tracker(data)
     print(f'[{datetime.now().strftime("%H:%M:%S")}] tracker: registered {sig.symbol} {sig.side} #{tid}')
     return tid
-
 
 def scanner_stats(data=None):
     data = data or load_tracker()
@@ -1886,10 +1984,13 @@ def tracker_summary_line(data=None):
 
 def _notify_tracker_result(title, rec, detail, data):
     dec = decimals_for_price(float(rec['entry']))
+    mfe = float(rec.get('max_favorable_r', 0.0) or 0.0)
+    mae = float(rec.get('max_adverse_r', 0.0) or 0.0)
     text = (
         f'{title} — {rec["label"]}\n'
         f'{rec["side"]} from {float(rec["entry"]):.{dec}f} | score {float(rec.get("score", 0)):.1f}/8\n'
         f'{detail}\n'
+        f'📏 MFE +{mfe:.2f}R | MAE -{mae:.2f}R\n'
         f'{tracker_summary_line(data)}'
     )
     print('\n' + text + '\n')
@@ -2032,6 +2133,22 @@ def update_tracked_signals_for_symbol(df, item, cfg):
                                 rec['reentry_armed_at'] = best_ts.isoformat()
                 changed = True
 
+            if 'max_adverse_r' not in rec:
+                rec['max_adverse_r'] = 0.0
+                entry0 = float(rec['entry']); stop0 = float(rec['stop']); risk0 = abs(entry0-stop0)
+                if risk0 > 0:
+                    hist = completed.copy()
+                    hist_idx = pd.to_datetime(hist.index, utc=True, errors='coerce')
+                    hist = hist.loc[hist_idx >= created.floor('5min')]
+                    if not hist.empty:
+                        if rec['side'] == 'LONG':
+                            adverse = (entry0 - hist['Low'].astype(float)) / risk0
+                        else:
+                            adverse = (hist['High'].astype(float) - entry0) / risk0
+                        if not adverse.empty:
+                            rec['max_adverse_r'] = float(max(0.0, adverse.max()))
+                changed = True
+
             last_checked = rec.get('last_checked_bar')
             last_ts = pd.Timestamp(last_checked) if last_checked else None
             if last_ts is not None:
@@ -2056,24 +2173,25 @@ def update_tracked_signals_for_symbol(df, item, cfg):
                 ts_iso = ts.isoformat()
                 status = rec.get('status', 'OPEN')
 
-                # Track maximum favorable excursion in R. Once the original trade
-                # has travelled far enough toward TP1, arm a possible second-chance
-                # entry if price later retests the original entry zone and confirms.
+                # Track both favorable and adverse excursion in R for exit research.
                 entry = float(rec['entry']); stop = float(rec['stop'])
                 risk_unit = abs(entry - stop)
-                if risk_unit > 0 and status == 'OPEN':
+                if risk_unit > 0 and status in {'OPEN', 'TP1_OPEN'}:
                     if rec['side'] == 'LONG':
                         favorable_r = (float(bar['High']) - entry) / risk_unit
+                        adverse_r = (entry - float(bar['Low'])) / risk_unit
                     else:
                         favorable_r = (entry - float(bar['Low'])) / risk_unit
+                        adverse_r = (float(bar['High']) - entry) / risk_unit
                     old_mfe = float(rec.get('max_favorable_r', 0.0) or 0.0)
+                    old_mae = float(rec.get('max_adverse_r', 0.0) or 0.0)
                     if favorable_r > old_mfe:
-                        rec['max_favorable_r'] = max(0.0, float(favorable_r))
-                        changed = True
+                        rec['max_favorable_r'] = max(0.0, float(favorable_r)); changed = True
+                    if adverse_r > old_mae:
+                        rec['max_adverse_r'] = max(0.0, float(adverse_r)); changed = True
                     reentry_arm_r = float(cfg.get('scanner', {}).get('reentry_arm_r', 0.80 * float(cfg['risk'].get('tp1_r_multiple', 1.5))))
-                    if rec.get('max_favorable_r', 0.0) >= reentry_arm_r and not rec.get('reentry_armed_at'):
-                        rec['reentry_armed_at'] = ts_iso
-                        changed = True
+                    if status == 'OPEN' and rec.get('max_favorable_r', 0.0) >= reentry_arm_r and not rec.get('reentry_armed_at'):
+                        rec['reentry_armed_at'] = ts_iso; changed = True
 
                 if status == 'OPEN':
                     if hit_stop and hit_tp1:
@@ -2284,6 +2402,7 @@ def main():
     if ig_status.get('ok'):
         IG_EXECUTOR.ensure_login()
     print('Market Scanner started.')
+    print('Decision Engine v2: ENABLED')
     print(f"Watchlist: {len(cfg['watchlist'])} instruments | min score {cfg['scanner']['minimum_score']} | core interval 5m")
     print('1-minute entry watcher: ENABLED for near-qualified 5m setups')
     print('Auto performance tracker: ENABLED (TP1 / TP2 / stop / expiry)')
@@ -2302,6 +2421,7 @@ def main():
         storage_line = '💾 Performance history: persistent' if persistent_tracker else '⚠️ Performance history resets on redeploy until a Railway volume is mounted'
         startup_message = (
             '✅ Market Scanner Online\n'
+            '🧠 Decision Engine v2: ENABLED\n'
             '🔄 Core strategy: confirmed 5-minute setups\n'
             '👀 1-minute entry watcher: ACTIVE when a setup is close\n'
             '🤖 Auto result tracking: ON (TP1 / TP2 / stop / expiry)\n'
