@@ -2477,7 +2477,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()    score: float
+    main()
     reason: str
     risk_gbp: float
     suggested_exposure_gbp: float | None
