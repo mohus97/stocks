@@ -61,6 +61,14 @@ class Candidate:
     context: dict = field(default_factory=dict)
 
 
+# Exit research v5 deliberately leaves the IG DEMO attached limit unchanged at
+# the original TP1 while we collect clean counterfactual data. This prevents a
+# mid-session execution-policy change from contaminating the demo sample.
+EXIT_RESEARCH_VERSION = 'hybrid_exit_v5_1_2026-08-24'
+SHADOW_EXIT_LEVELS_R = (0.50, 0.75, 1.00, 1.50, 2.50)
+HYBRID_BANK_R = 0.75
+HYBRID_BANK_FRACTION = 0.70
+HYBRID_RUNNER_R = 1.50
 
 
 IG_DEMO_BASE = 'https://demo-api.ig.com/gateway/deal'
@@ -1361,6 +1369,82 @@ def _atr_percentile(d, current_atr):
     return float((vals <= current_atr).mean() * 100.0)
 
 
+def _recent_directional_shock(completed, atr_v, lookback=8):
+    """Detect a recent abnormal 5m impulse that can invalidate lagging HTF signals.
+
+    A large directional candle is treated as a temporary regime shock. Counter-shock
+    entries are blocked until price reclaims the shock extreme. This specifically
+    prevents a stale 15m/1h up-trend from immediately authorising a LONG after a
+    violent bearish dump (and vice versa).
+    """
+    if completed is None or len(completed) < 4 or not np.isfinite(atr_v) or atr_v <= 0:
+        return {'direction': None, 'bars_since': None, 'severity': 0.0, 'reclaimed_long': True, 'reclaimed_short': True}
+    w = completed.tail(max(4, int(lookback))).copy()
+    best = None
+    # The latest qualifying shock is the relevant regime event. An older, larger
+    # candle must not override a newer opposite shock that has already changed the tape.
+    for pos in range(len(w)-1, -1, -1):
+        r = w.iloc[pos]
+        op, cl, hi, lo = map(float, (r['Open'], r['Close'], r['High'], r['Low']))
+        rng = max(hi - lo, 1e-12)
+        body = abs(cl - op)
+        body_ratio = body / rng
+        body_atr = body / atr_v
+        range_atr = rng / atr_v
+        directional = body_ratio >= 0.52 and (body_atr >= 1.00 or range_atr >= 1.65)
+        if not directional:
+            continue
+        severity = max(body_atr, 0.72 * range_atr)
+        best = {
+            'pos': pos, 'direction': 'UP' if cl > op else 'DOWN', 'severity': float(severity),
+            'open': op, 'close': cl, 'high': hi, 'low': lo,
+        }
+        break
+    if best is None:
+        return {'direction': None, 'bars_since': None, 'severity': 0.0, 'reclaimed_long': True, 'reclaimed_short': True}
+    bars_since = len(w) - 1 - int(best['pos'])
+    current_close = float(w.iloc[-1]['Close'])
+    reclaim_buffer = 0.05 * atr_v
+    best.update({
+        'bars_since': bars_since,
+        'reclaimed_long': current_close > best['high'] + reclaim_buffer,
+        'reclaimed_short': current_close < best['low'] - reclaim_buffer,
+    })
+    return best
+
+
+def _one_minute_opposite_shock(df1m, side, atr_v, live_price):
+    """Fail-safe for shocks occurring after the 5m candidate was armed.
+
+    Uses the candidate's 5m ATR so a single abnormal 1m candle can cancel an armed
+    trade before the watcher turns it into an alert. Returns (blocked, reason).
+    """
+    if df1m is None or len(df1m) < 5 or not np.isfinite(atr_v) or atr_v <= 0:
+        return False, ''
+    completed = df1m.iloc[:-1].tail(15)
+    target_dir = 'DOWN' if str(side).upper() == 'LONG' else 'UP'
+    for i in range(len(completed)-1, -1, -1):
+        r = completed.iloc[i]
+        op, cl, hi, lo = map(float, (r['Open'], r['Close'], r['High'], r['Low']))
+        rng = max(hi - lo, 1e-12)
+        body = abs(cl - op)
+        body_ratio = body / rng
+        direction = 'UP' if cl > op else 'DOWN'
+        is_shock = direction == target_dir and body_ratio >= 0.55 and (body >= 0.65 * atr_v or rng >= 1.00 * atr_v)
+        if not is_shock:
+            continue
+        if target_dir == 'DOWN':
+            reclaimed = float(live_price) > hi + 0.03 * atr_v
+            if not reclaimed:
+                return True, f'recent bearish 1m shock not reclaimed ({len(completed)-1-i} bars ago)'
+        else:
+            reclaimed = float(live_price) < lo - 0.03 * atr_v
+            if not reclaimed:
+                return True, f'recent bullish 1m shock not reclaimed ({len(completed)-1-i} bars ago)'
+        break
+    return False, ''
+
+
 def _decision_snapshot(df, item, cfg):
     """Return independent Decision Engine v2 components for LONG and SHORT."""
     if df is None or len(df) < 65:
@@ -1409,6 +1493,7 @@ def _decision_snapshot(df, item, cfg):
     trend_strength = min(1.0, 0.55 * min(1.0, ema_sep / 0.55) + 0.45 * min(1.0, abs(ema_slope) / 0.12))
     vol_ok = 12.0 <= atr_pct <= 97.5
     vol_extreme = atr_pct > 99.0
+    shock = _recent_directional_shock(completed, atr_v, lookback=8)
 
     results = {}
     for side in ('LONG', 'SHORT'):
@@ -1420,6 +1505,16 @@ def _decision_snapshot(df, item, cfg):
         if opposite15: veto_reasons.append('15m regime opposite')
         if strong_opposite1h: veto_reasons.append('1h strongly opposite')
         if vol_extreme: veto_reasons.append('extreme volatility')
+
+        # Regime-shock veto: lagging HTF trend must not override a fresh violent
+        # move in the opposite direction. Require a reclaim of the shock extreme.
+        recent_shock = shock.get('direction') is not None and (shock.get('bars_since') is not None) and int(shock.get('bars_since')) <= 7
+        if long and recent_shock and shock.get('direction') == 'DOWN' and not shock.get('reclaimed_long', False):
+            veto = True
+            veto_reasons.append(f"bearish 5m shock not reclaimed ({int(shock.get('bars_since', 0))} bars ago)")
+        if (not long) and recent_shock and shock.get('direction') == 'UP' and not shock.get('reclaimed_short', False):
+            veto = True
+            veto_reasons.append(f"bullish 5m shock not reclaimed ({int(shock.get('bars_since', 0))} bars ago)")
 
         same15 = reg15['name'] == ('TREND_UP' if long else 'TREND_DOWN')
         same1h = reg1h['name'] == ('TREND_UP' if long else 'TREND_DOWN')
@@ -1479,6 +1574,14 @@ def _decision_snapshot(df, item, cfg):
         if exhausted:
             veto_reasons.append('momentum exhausted')
 
+        # Quality floor: a 1m breakout is not allowed to manufacture a 6/8 trade
+        # when BOTH trend/volatility and momentum confirmation are absent. This is
+        # exactly the failure mode seen on PLTR: HTF/structure stayed bullish while
+        # the immediate tape had no supporting momentum or volatility quality.
+        if tv <= 0.0 and momentum <= 0.0:
+            veto = True
+            veto_reasons.append('no trend/vol or momentum confirmation')
+
         score = htf + structure + tv + setup5 + momentum  # max 7 before 1m execution
         components = {
             'htf_regime': round(htf, 2),
@@ -1504,6 +1607,9 @@ def _decision_snapshot(df, item, cfg):
         'nearest_support_atr': round(float(sup_dist_atr), 3),
         'candle_body_ratio': round(float(body_ratio), 3),
         'live_price': live_price,
+        'recent_shock_direction': shock.get('direction'),
+        'recent_shock_bars_since': shock.get('bars_since'),
+        'recent_shock_severity_atr': round(float(shock.get('severity', 0.0) or 0.0), 3),
     }
     return {'d': d, 'row': row, 'prev': prev, 'live': live, 'atr': atr_v, 'close': close, 'live_price': live_price,
             'results': results, 'context': context}
@@ -1518,6 +1624,82 @@ def _v2_reason(side_result, context):
     )
 
 
+def _gold_like_core(context):
+    """Return True for the core pattern we want more of: strong HTF + structure + trend/vol + momentum."""
+    c = dict((context or {}).get('score_components') or {})
+    return (
+        float(c.get('htf_regime', 0.0) or 0.0) >= 1.75
+        and float(c.get('structure_location', 0.0) or 0.0) >= 2.0
+        and float(c.get('trend_volatility', 0.0) or 0.0) >= 1.0
+        and float(c.get('momentum_quality', 0.0) or 0.0) >= 1.0
+    )
+
+
+def quality_tier(score, context):
+    """Classify setup quality without changing risk or overriding hard vetoes.
+
+    A-TIER is intentionally strict and models the clean Gold-style pattern:
+    strong 15m/1h alignment, full structure, full trend/volatility and full
+    momentum, plus either a meaningful 5m setup or a confirmed 1m trigger.
+    """
+    c = dict((context or {}).get('score_components') or {})
+    trigger_1m = float(c.get('trigger_1m', 0.0) or 0.0)
+    setup_5m = float(c.get('setup_5m', 0.0) or 0.0)
+    if _gold_like_core(context):
+        if (float(score) >= 6.75 and setup_5m >= 0.5) or (float(score) >= 7.0 and trigger_1m >= 1.0):
+            return 'A-TIER'
+    if float(score) >= 6.5:
+        return 'B+'
+    return 'B-TIER'
+
+
+def _r_target_price(entry, stop, side, r_multiple):
+    risk = abs(float(entry) - float(stop))
+    if str(side).upper() == 'LONG':
+        return float(entry) + float(r_multiple) * risk
+    return float(entry) - float(r_multiple) * risk
+
+
+def exit_research_plan(tier):
+    """Return the v5 profit-taking experiment for a setup tier.
+
+    B/B+ tests a simple full exit at +0.75R. A-TIER tests the hybrid idea:
+    bank 70% at +0.75R, move the remaining 30% stop to entry, and let that
+    runner target +1.50R. This is research guidance only; automated IG orders
+    remain on the existing full-TP1 execution rule until the data says to move.
+    """
+    if str(tier) == 'A-TIER':
+        return {
+            'mode': 'HYBRID_70_30',
+            'bank_r': HYBRID_BANK_R,
+            'bank_fraction': HYBRID_BANK_FRACTION,
+            'runner_fraction': 1.0 - HYBRID_BANK_FRACTION,
+            'runner_r': HYBRID_RUNNER_R,
+        }
+    return {'mode': 'FIXED_0.75R', 'target_r': HYBRID_BANK_R}
+
+
+def exit_research_alert_line(s, tier=None):
+    tier = tier or (s.context or {}).get('quality_tier') or quality_tier(s.score, s.context or {})
+    dec = decimals_for_price(s.price)
+    plan = exit_research_plan(tier)
+    p075 = _r_target_price(s.price, s.stop, s.side, HYBRID_BANK_R)
+    if plan['mode'] == 'HYBRID_70_30':
+        p15 = _r_target_price(s.price, s.stop, s.side, HYBRID_RUNNER_R)
+        return (
+            f"💰 v5.1 research exit: bank 70% @ +0.75R ({p075:.{dec}f}); "
+            f"runner 30% → +1.50R ({p15:.{dec}f}); after bank, runner stop → entry"
+        )
+    return f"💰 v5.1 research exit: full bank @ +0.75R ({p075:.{dec}f}); TP1/TP2 remain shadow-tracked"
+
+
+def _candidate_priority(c):
+    """Prioritise Gold-like cores for scarce 1m watcher slots, then score."""
+    core = 1 if _gold_like_core(c.context or {}) else 0
+    cfd = 1 if c.market_type in ('metal', 'index', 'forex') else 0
+    return (core, cfd, float(c.score))
+
+
 def score_signal(df, item, cfg):
     snap = _decision_snapshot(df, item, cfg)
     if not snap:
@@ -1525,7 +1707,7 @@ def score_signal(df, item, cfg):
     row, prev = snap['row'], snap['prev']
     live_price, atr_v = snap['live_price'], snap['atr']
     min_score = float(cfg['scanner']['minimum_score'])
-    direct_min_score = min_score + (0.5 if item.get('type', 'stock') in ('forex','index','metal') else 0.0)
+    direct_min_score = min_score  # Aggressive v2: direct CFD entries allowed from 6.0/8
     candidates = []
     for side in ('LONG', 'SHORT'):
         r = snap['results'][side]
@@ -1537,7 +1719,7 @@ def score_signal(df, item, cfg):
 
     # Decision Engine v2 deliberately chases less than v1.
     trigger_close = float(row['Close'])
-    if abs(live_price - trigger_close) > 0.45 * atr_v:
+    if abs(live_price - trigger_close) > 0.60 * atr_v:  # Aggressive v2: looser direct anti-chase tolerance
         return None
     d = snap['d']
     recent_low = float(d['Low'].iloc[-10:-1].min())
@@ -1566,6 +1748,8 @@ def score_signal(df, item, cfg):
     context = dict(snap['context'])
     context['score_components'] = dict(side_result['components'])
     context['veto_reasons'] = list(side_result['veto_reasons'])
+    context['quality_tier'] = quality_tier(float(side_result['score']), context)
+    context['gold_like_core'] = _gold_like_core(context)
     return Signal(
         symbol=item['symbol'], label=item.get('name', item['symbol']), market_type=item.get('type', 'stock'),
         side=side, price=float(price), stop=float(stop), tp1=float(tp1), tp2=float(tp2),
@@ -1593,7 +1777,7 @@ def candidate_from_5m(df, item, cfg):
             continue
         trigger = float(row['High']) if side == 'LONG' else float(row['Low'])
         distance = (trigger - live_price) if side == 'LONG' else (live_price - trigger)
-        if distance > 0.50 * atr_v or distance < -0.22 * atr_v:
+        if distance > 0.50 * atr_v or distance < -0.29 * atr_v:  # Aggressive v2: allow slightly more extension before arming
             continue
         choices.append((r['score'], side, trigger, r))
     if not choices:
@@ -1603,6 +1787,8 @@ def candidate_from_5m(df, item, cfg):
     context = dict(snap['context'])
     context['score_components'] = dict(side_result['components'])
     context['veto_reasons'] = list(side_result['veto_reasons'])
+    context['gold_like_core'] = _gold_like_core(context)
+    context['quality_tier'] = quality_tier(float(score), context)
     return Candidate(
         symbol=item['symbol'], label=item.get('name', item['symbol']), market_type=item.get('type', 'stock'),
         provider=item.get('provider', 'yahoo'), data_symbol=item.get('data_symbol', item['symbol']), side=side,
@@ -1617,8 +1803,8 @@ def select_candidates(candidates, cfg):
     sc = cfg.get('scanner', {})
     max_yahoo = int(sc.get('entry_watch_max_yahoo_candidates', 5))
     max_td = int(sc.get('entry_watch_max_twelvedata_candidates', 1))
-    yahoo = sorted([c for c in candidates if c.provider != 'twelvedata'], key=lambda c: c.score, reverse=True)[:max_yahoo]
-    td = sorted([c for c in candidates if c.provider == 'twelvedata'], key=lambda c: c.score, reverse=True)[:max_td]
+    yahoo = sorted([c for c in candidates if c.provider != 'twelvedata'], key=_candidate_priority, reverse=True)[:max_yahoo]
+    td = sorted([c for c in candidates if c.provider == 'twelvedata'], key=_candidate_priority, reverse=True)[:max_td]
     chosen = yahoo + td
     return {c.symbol: c for c in chosen}
 
@@ -1676,10 +1862,13 @@ def build_signal_from_candidate(c, entry_price, cfg, trigger_meta=None):
     if trigger_meta:
         context.update(trigger_meta)
     mode = context.get('trigger_mode', 'confirmed')
+    final_score = float(min(8.0, c.score + 1.0))
+    context['quality_tier'] = quality_tier(final_score, context)
+    context['gold_like_core'] = _gold_like_core(context)
     return Signal(
         symbol=c.symbol, label=c.label, market_type=c.market_type, side=c.side, price=float(entry_price),
         stop=float(stop), tp1=float(tp1), tp2=float(tp2), entry_low=entry_low, entry_high=entry_high,
-        score=float(min(8.0, c.score + 1.0)),
+        score=final_score,
         reason=(c.reason + f', 1m {mode} confirmed').strip(', '), risk_gbp=float(risk_gbp),
         suggested_exposure_gbp=float(suggested) if suggested else None,
         timestamp=datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds'), context=context,
@@ -1688,30 +1877,73 @@ def build_signal_from_candidate(c, entry_price, cfg, trigger_meta=None):
 def format_1m_signal(s: Signal):
     dec = decimals_for_price(s.price)
     emoji = '🟢' if s.side == 'LONG' else '🔴'
+    tier = (s.context or {}).get('quality_tier') or quality_tier(s.score, s.context or {})
+    tier_badge = '🔥 A-TIER' if tier == 'A-TIER' else ('⭐ B+' if tier == 'B+' else '⚡ B-TIER')
+    in_zone = s.entry_low <= s.price <= s.entry_high
+    zone_status = (
+        "✅ Trigger price is INSIDE the entry zone"
+        if in_zone else
+        "🚫 Trigger price is OUTSIDE the entry zone — WAIT for a retest/new alert"
+    )
     is_cfd = s.market_type in ('forex', 'index', 'metal') or s.side == 'SHORT'
     sizing_line = (
         f"📐 CFD sizing: choose units so the stop costs no more than ~£{s.risk_gbp:.2f}"
         if is_cfd else
-        f"📦 Cash exposure guide: up to ~£{s.suggested_exposure_gbp:,.0f}" if s.suggested_exposure_gbp else
-        f"📦 Size to max loss ~£{s.risk_gbp:.2f}"
+        f"📦 Max stock-CFD NOTIONAL guide: ~£{s.suggested_exposure_gbp:,.0f} (NOT margin)" if s.suggested_exposure_gbp else
+        f"📦 Size from stop risk only: max loss ~£{s.risk_gbp:.2f}"
     )
     note = ''
     if is_cfd:
         note = '\n⚠️ Check the live Trading 212 bid/ask before entering; spread/leverage can change real risk.'
+    else:
+        note = '\n🚫 Trading212 CFD: DO NOT use all available margin. Size from STOP risk; the figure above is NOTIONAL, not margin.'
     return (
         f"🚨 1-MIN ENTRY — {s.label}\n"
+        f"{tier_badge} — {'Gold-like quality profile' if tier == 'A-TIER' else 'aggressive-v2 setup'}\n"
         f"{emoji} {s.side} — TRIGGER CONFIRMED near {s.price:.{dec}f}\n"
         f"✅ Entry zone: {s.entry_low:.{dec}f} – {s.entry_high:.{dec}f}\n"
-        f"🚫 Outside the zone: WAIT for a retest/new alert\n"
+        f"{zone_status}\n"
         f"🛑 Stop: {s.stop:.{dec}f}\n"
         f"🎯 TP1: {s.tp1:.{dec}f}\n"
         f"🎯 TP2: {s.tp2:.{dec}f}\n"
+        f"{exit_research_alert_line(s, tier)}\n"
         f"⭐ 5m setup + 1m trigger: {s.score:.1f}/8\n"
         f"💷 Max planned loss: ~£{s.risk_gbp:.2f}\n"
         f"{sizing_line}\n"
         f"Reason: {s.reason}{note}\n"
         f"🕒 {s.timestamp}"
     )
+
+
+def _revalidate_armed_candidate_5m(c, cfg):
+    """Re-check an armed 1m candidate against a fresh 5m snapshot at trigger time.
+
+    Candidates can otherwise become stale while waiting several minutes for a 1m
+    trigger. Fail closed: if fresh 5m data cannot confirm the same side, cancel it.
+    """
+    item = next((i for i in cfg.get('watchlist', []) if i.get('symbol') == c.symbol), None)
+    if item is None:
+        return False, 'watchlist item missing', None
+    fresh = fetch_item(item, cfg)
+    if fresh is None or not data_is_fresh(fresh, item, cfg):
+        return False, 'fresh 5m revalidation unavailable/stale', None
+    snap = _decision_snapshot(fresh, item, cfg)
+    if not snap:
+        return False, 'fresh 5m decision snapshot unavailable', None
+    r = snap['results'].get(c.side) or {}
+    min_score = float(cfg['scanner']['minimum_score'])
+    gap = float(cfg.get('scanner', {}).get('entry_watch_near_score_gap', 1.0))
+    near_threshold = max(0.0, min_score - gap)
+    if r.get('veto'):
+        reasons = ', '.join(r.get('veto_reasons') or []) or 'hard veto'
+        return False, f'fresh 5m veto: {reasons}', snap
+    if float(r.get('score', 0.0) or 0.0) < near_threshold:
+        return False, f'fresh 5m score fell to {float(r.get("score",0.0)):.1f}', snap
+    opp = 'SHORT' if c.side == 'LONG' else 'LONG'
+    ro = snap['results'].get(opp) or {}
+    if not ro.get('veto') and float(ro.get('score', 0.0) or 0.0) >= float(r.get('score', 0.0) or 0.0) + 0.75:
+        return False, f'fresh 5m direction flipped toward {opp}', snap
+    return True, 'same-side 5m thesis still valid', snap
 
 
 def watch_1m_entries(cfg, armed):
@@ -1750,12 +1982,12 @@ def watch_1m_entries(cfg, armed):
                 breakout_now = prev_close <= c.trigger_level and close > c.trigger_level
                 retest_hold = prev_close > c.trigger_level and low <= c.trigger_level + 0.05*c.atr_value and close > c.trigger_level
                 quality = close > op and body_ratio >= (0.45 if breakout_now else 0.32) and close_pos >= 0.68 and (high-max(op,close))/rng <= 0.28
-                too_far = live_price - c.trigger_level > 0.25 * c.atr_value
+                too_far = live_price - c.trigger_level > 0.33 * c.atr_value
             else:
                 breakout_now = prev_close >= c.trigger_level and close < c.trigger_level
                 retest_hold = prev_close < c.trigger_level and high >= c.trigger_level - 0.05*c.atr_value and close < c.trigger_level
                 quality = close < op and body_ratio >= (0.45 if breakout_now else 0.32) and close_pos <= 0.32 and (min(op,close)-low)/rng <= 0.28
-                too_far = c.trigger_level - live_price > 0.25 * c.atr_value
+                too_far = c.trigger_level - live_price > 0.33 * c.atr_value
 
             triggered = breakout_now or retest_hold
             if not triggered:
@@ -1767,8 +1999,24 @@ def watch_1m_entries(cfg, armed):
                 print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m trigger confirmed but entry stretched; skip')
                 remaining.pop(symbol, None); continue
 
+            shock_blocked, shock_reason = _one_minute_opposite_shock(df, c.side, c.atr_value, live_price)
+            if shock_blocked:
+                print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m trigger CANCELLED — {shock_reason}')
+                remaining.pop(symbol, None); continue
+
+            still_valid, validation_reason, fresh_snap = _revalidate_armed_candidate_5m(c, cfg)
+            if not still_valid:
+                print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m trigger CANCELLED — {validation_reason}')
+                remaining.pop(symbol, None); continue
+
             mode = 'retest_hold' if retest_hold and not breakout_now else 'breakout'
-            trigger_meta = {'trigger_mode': mode, 'trigger_body_ratio': round(float(body_ratio),3), 'trigger_close_position': round(float(close_pos),3)}
+            trigger_meta = {
+                'trigger_mode': mode, 'trigger_body_ratio': round(float(body_ratio),3),
+                'trigger_close_position': round(float(close_pos),3),
+                'trigger_5m_revalidated': True, 'trigger_5m_validation': validation_reason,
+            }
+            if fresh_snap:
+                trigger_meta['trigger_revalidation_shock'] = fresh_snap.get('context', {}).get('recent_shock_direction')
             sig = build_signal_from_candidate(c, live_price, cfg, trigger_meta=trigger_meta)
             if not sig:
                 remaining.pop(symbol, None); continue
@@ -1801,24 +2049,36 @@ def decimals_for_price(x):
 def format_signal(s: Signal):
     dec = decimals_for_price(s.price)
     emoji = '🟢' if s.side == 'LONG' else '🔴'
+    tier = (s.context or {}).get('quality_tier') or quality_tier(s.score, s.context or {})
+    tier_badge = '🔥 A-TIER' if tier == 'A-TIER' else ('⭐ B+' if tier == 'B+' else '⚡ B-TIER')
+    in_zone = s.entry_low <= s.price <= s.entry_high
+    zone_status = (
+        "✅ Signal price is INSIDE the entry zone"
+        if in_zone else
+        "🚫 Signal price is OUTSIDE the entry zone — WAIT for a retest/new alert"
+    )
     is_cfd = s.market_type in ('forex', 'index', 'metal') or s.side == 'SHORT'
     sizing_line = (
         f"📐 CFD sizing: choose units so the stop costs no more than ~£{s.risk_gbp:.2f}"
         if is_cfd else
-        f"📦 Cash exposure guide: up to ~£{s.suggested_exposure_gbp:,.0f}" if s.suggested_exposure_gbp else
-        f"📦 Size to max loss ~£{s.risk_gbp:.2f}"
+        f"📦 Max stock-CFD NOTIONAL guide: ~£{s.suggested_exposure_gbp:,.0f} (NOT margin)" if s.suggested_exposure_gbp else
+        f"📦 Size from stop risk only: max loss ~£{s.risk_gbp:.2f}"
     )
     note = ''
     if is_cfd:
         note += '\n⚠️ Check the live Trading 212 bid/ask before entering; spread/leverage can change real risk.'
+    else:
+        note += '\n⚠️ Trading212 CFD: size from STOP risk, not available margin. Leverage is not permission to exceed the notional guide.'
     return (
         f"⚡ 5-MIN SETUP — {s.label}\n"
+        f"{tier_badge} — {'Gold-like quality profile' if tier == 'A-TIER' else 'aggressive-v2 setup'}\n"
         f"{emoji} {s.side} — CONFIRMED near {s.price:.{dec}f}\n"
         f"✅ Entry zone: {s.entry_low:.{dec}f} – {s.entry_high:.{dec}f}\n"
-        f"🚫 Outside the zone: WAIT for a retest/new alert\n"
+        f"{zone_status}\n"
         f"🛑 Stop: {s.stop:.{dec}f}\n"
         f"🎯 TP1: {s.tp1:.{dec}f}\n"
         f"🎯 TP2: {s.tp2:.{dec}f}\n"
+        f"{exit_research_alert_line(s, tier)}\n"
         f"⭐ Score: {s.score:.1f}/8\n"
         f"💷 Max planned loss: ~£{s.risk_gbp:.2f}\n"
         f"{sizing_line}\n"
@@ -1934,6 +2194,14 @@ def register_tracked_signal(sig: Signal, item=None):
     provider = (item or {}).get('provider', 'yahoo')
     data_symbol = (item or {}).get('data_symbol', sig.symbol)
     ctx = dict(getattr(sig, 'context', {}) or {})
+    tier = ctx.get('quality_tier') or quality_tier(sig.score, ctx)
+    plan = exit_research_plan(tier)
+    shadow_exits = {
+        f'{r:.2f}': {'target_r': float(r), 'status': 'OPEN', 'result_r': 0.0, 'hit_at': None}
+        for r in SHADOW_EXIT_LEVELS_R
+    }
+    recommended_exit = dict(plan)
+    recommended_exit.update({'status': 'OPEN', 'result_r': 0.0, 'bank_hit_at': None, 'closed_at': None})
     rec = {
         'id': tid, 'symbol': sig.symbol, 'label': sig.label, 'market_type': sig.market_type,
         'provider': provider, 'data_symbol': data_symbol, 'side': sig.side,
@@ -1948,11 +2216,142 @@ def register_tracked_signal(sig: Signal, item=None):
         'atr_value': ctx.get('atr_value'), 'atr_percentile': ctx.get('atr_percentile'),
         'trend_strength': ctx.get('trend_strength'), 'nearest_resistance_atr': ctx.get('nearest_resistance_atr'),
         'nearest_support_atr': ctx.get('nearest_support_atr'), 'score_components': ctx.get('score_components'),
+        'quality_tier': tier, 'gold_like_core': ctx.get('gold_like_core'),
         'trigger_mode': ctx.get('trigger_mode'), 'trigger_body_ratio': ctx.get('trigger_body_ratio'),
+        'exit_research_version': EXIT_RESEARCH_VERSION,
+        'shadow_exits': shadow_exits, 'recommended_exit': recommended_exit,
     }
     data['signals'].append(rec); save_tracker(data)
     print(f'[{datetime.now().strftime("%H:%M:%S")}] tracker: registered {sig.symbol} {sig.side} #{tid}')
     return tid
+
+def _bar_hits_r_target(rec, bar, r_multiple):
+    target = _r_target_price(rec['entry'], rec['stop'], rec['side'], r_multiple)
+    high = float(bar['High']); low = float(bar['Low'])
+    if rec['side'] == 'LONG':
+        return high >= target
+    return low <= target
+
+
+def _bar_hits_entry(rec, bar):
+    entry = float(rec['entry']); high = float(bar['High']); low = float(bar['Low'])
+    return low <= entry <= high
+
+
+def _update_exit_research_for_bar(rec, bar, ts_iso):
+    """Update independent fixed-target shadows plus the recommended v5 model."""
+    if rec.get('exit_research_version') != EXIT_RESEARCH_VERSION:
+        return False
+    changed = False
+    high = float(bar['High']); low = float(bar['Low'])
+    if rec['side'] == 'LONG':
+        hit_stop = low <= float(rec['stop'])
+    else:
+        hit_stop = high >= float(rec['stop'])
+
+    shadows = rec.setdefault('shadow_exits', {})
+    for r in SHADOW_EXIT_LEVELS_R:
+        key = f'{r:.2f}'
+        sh = shadows.setdefault(key, {'target_r': float(r), 'status': 'OPEN', 'result_r': 0.0, 'hit_at': None})
+        if sh.get('status') != 'OPEN':
+            continue
+        hit_target = _bar_hits_r_target(rec, bar, r)
+        if hit_stop and hit_target:
+            sh.update({'status': 'AMBIGUOUS', 'result_r': 0.0, 'hit_at': ts_iso})
+            changed = True
+        elif hit_stop:
+            sh.update({'status': 'STOPPED', 'result_r': -1.0, 'hit_at': ts_iso})
+            changed = True
+        elif hit_target:
+            sh.update({'status': 'HIT', 'result_r': float(r), 'hit_at': ts_iso})
+            changed = True
+
+    rx = rec.setdefault('recommended_exit', {})
+    mode = rx.get('mode') or exit_research_plan(rec.get('quality_tier'))['mode']
+    rx.setdefault('mode', mode)
+    status = rx.get('status', 'OPEN')
+    if mode == 'FIXED_0.75R' and status == 'OPEN':
+        hit_target = _bar_hits_r_target(rec, bar, HYBRID_BANK_R)
+        if hit_stop and hit_target:
+            rx.update({'status': 'AMBIGUOUS', 'result_r': 0.0, 'closed_at': ts_iso})
+            changed = True
+        elif hit_stop:
+            rx.update({'status': 'STOPPED', 'result_r': -1.0, 'closed_at': ts_iso})
+            changed = True
+        elif hit_target:
+            rx.update({'status': 'HIT', 'result_r': HYBRID_BANK_R, 'closed_at': ts_iso})
+            changed = True
+    elif mode == 'HYBRID_70_30':
+        if status == 'OPEN':
+            hit_bank = _bar_hits_r_target(rec, bar, HYBRID_BANK_R)
+            if hit_stop and hit_bank:
+                rx.update({'status': 'AMBIGUOUS', 'result_r': 0.0, 'closed_at': ts_iso})
+                changed = True
+            elif hit_stop:
+                rx.update({'status': 'STOPPED', 'result_r': -1.0, 'closed_at': ts_iso})
+                changed = True
+            elif hit_bank:
+                banked_r = HYBRID_BANK_FRACTION * HYBRID_BANK_R
+                rx.update({'status': 'RUNNER', 'result_r': banked_r, 'bank_hit_at': ts_iso})
+                changed = True
+        elif status == 'RUNNER':
+            hit_runner = _bar_hits_r_target(rec, bar, HYBRID_RUNNER_R)
+            hit_be = _bar_hits_entry(rec, bar)
+            banked_r = HYBRID_BANK_FRACTION * HYBRID_BANK_R
+            if hit_runner and not hit_be:
+                full_r = banked_r + (1.0 - HYBRID_BANK_FRACTION) * HYBRID_RUNNER_R
+                rx.update({'status': 'RUNNER_HIT', 'result_r': full_r, 'closed_at': ts_iso})
+                changed = True
+            elif hit_be:
+                # Conservative when both runner target and breakeven occur in the
+                # same 5m candle: only credit the already-banked 70% portion.
+                rx.update({'status': 'BANK_ONLY', 'result_r': banked_r, 'closed_at': ts_iso})
+                changed = True
+    return changed
+
+
+def _expire_exit_research(rec, ts_iso):
+    if rec.get('exit_research_version') != EXIT_RESEARCH_VERSION:
+        return False
+    changed = False
+    for sh in (rec.get('shadow_exits') or {}).values():
+        if sh.get('status') == 'OPEN':
+            sh.update({'status': 'EXPIRED', 'result_r': 0.0, 'hit_at': ts_iso})
+            changed = True
+    rx = rec.get('recommended_exit') or {}
+    if rx.get('status') == 'OPEN':
+        rx.update({'status': 'EXPIRED', 'result_r': 0.0, 'closed_at': ts_iso})
+        changed = True
+    elif rx.get('status') == 'RUNNER':
+        banked_r = HYBRID_BANK_FRACTION * HYBRID_BANK_R
+        rx.update({'status': 'BANK_ONLY_EXPIRED', 'result_r': banked_r, 'closed_at': ts_iso})
+        changed = True
+    return changed
+
+
+def exit_research_summary_line(data=None):
+    data = data or load_tracker()
+    rows = [r for r in data.get('signals', []) if r.get('exit_research_version') == EXIT_RESEARCH_VERSION]
+    if not rows:
+        return '🧪 Exit research v5.1: collecting fresh cohort data'
+    chunks = []
+    for r in SHADOW_EXIT_LEVELS_R:
+        key = f'{r:.2f}'
+        vals = []
+        for rec in rows:
+            sh = (rec.get('shadow_exits') or {}).get(key) or {}
+            if sh.get('status') in {'HIT', 'STOPPED', 'EXPIRED'}:
+                vals.append(float(sh.get('result_r', 0.0) or 0.0))
+        total = sum(vals)
+        chunks.append(f'{r:.2f}R {total:+.2f}R/{len(vals)}')
+    recommended = []
+    for rec in rows:
+        rx = rec.get('recommended_exit') or {}
+        if rx.get('status') not in {'OPEN', 'RUNNER', 'AMBIGUOUS', None}:
+            recommended.append(float(rx.get('result_r', 0.0) or 0.0))
+    rec_text = f' | recommended {sum(recommended):+.2f}R/{len(recommended)}' if recommended else ''
+    return '🧪 Exit v5.1: ' + ' | '.join(chunks) + rec_text
+
 
 def scanner_stats(data=None):
     data = data or load_tracker()
@@ -1991,7 +2390,8 @@ def _notify_tracker_result(title, rec, detail, data):
         f'{rec["side"]} from {float(rec["entry"]):.{dec}f} | score {float(rec.get("score", 0)):.1f}/8\n'
         f'{detail}\n'
         f'📏 MFE +{mfe:.2f}R | MAE -{mae:.2f}R\n'
-        f'{tracker_summary_line(data)}'
+        f'{tracker_summary_line(data)}\n'
+        f'{exit_research_summary_line(data)}'
     )
     print('\n' + text + '\n')
     telegram_notify(text)
@@ -2173,6 +2573,9 @@ def update_tracked_signals_for_symbol(df, item, cfg):
                 ts_iso = ts.isoformat()
                 status = rec.get('status', 'OPEN')
 
+                if _update_exit_research_for_bar(rec, bar, ts_iso):
+                    changed = True
+
                 # Track both favorable and adverse excursion in R for exit research.
                 entry = float(rec['entry']); stop = float(rec['stop'])
                 risk_unit = abs(entry - stop)
@@ -2291,6 +2694,8 @@ def expire_old_tracked_signals(cfg):
                 detail = f'Neither TP1 nor stop reached within {hours:g}h — expired, 0.0R'
                 title = '⏳ SCANNER RESULT: EXPIRED'
             rec['closed_at'] = now.isoformat()
+            if _expire_exit_research(rec, now.isoformat()):
+                changed = True
             changed = True
             _notify_tracker_result(title, rec, detail, data)
         except Exception as e:
@@ -2303,6 +2708,27 @@ def signature(sig: Signal):
     bucket = round(sig.price, decimals_for_price(sig.price))
     raw = f'{sig.symbol}|{sig.side}|{bucket}|{round(sig.score,1)}'
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def _near_setup_block_reason(df, item, cfg):
+    """Return a concise reason when a near-qualified side was blocked by a hard veto."""
+    try:
+        snap = _decision_snapshot(df, item, cfg)
+        if not snap:
+            return ''
+        min_score = float(cfg['scanner']['minimum_score'])
+        gap = float(cfg.get('scanner', {}).get('entry_watch_near_score_gap', 1.0))
+        near_threshold = max(0.0, min_score - gap)
+        blocked = []
+        for side in ('LONG', 'SHORT'):
+            r = snap['results'].get(side) or {}
+            score = float(r.get('score', 0.0) or 0.0)
+            if score >= near_threshold and r.get('veto'):
+                reasons = ', '.join(r.get('veto_reasons') or []) or 'hard veto'
+                blocked.append(f'{side} {score:.1f}/7 blocked: {reasons}')
+        return '; '.join(blocked)
+    except Exception:
+        return ''
 
 
 def scan_once(cfg, include_twelvedata=True):
@@ -2348,7 +2774,9 @@ def scan_once(cfg, include_twelvedata=True):
                     candidates.append(c)
                     print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: near setup — 1m watcher armed {c.side} @ {c.trigger_level:.5f} (score {c.score:.1f})')
                 else:
-                    print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: no confirmed setup')
+                    blocked_reason = _near_setup_block_reason(df, item, cfg)
+                    suffix = f' — {blocked_reason}' if blocked_reason else ''
+                    print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: no confirmed setup{suffix}')
                 continue
 
             sig_id = signature(sig)
@@ -2403,6 +2831,17 @@ def main():
         IG_EXECUTOR.ensure_login()
     print('Market Scanner started.')
     print('Decision Engine v2: ENABLED')
+    print('Aggressive v2 demo profile: ENABLED')
+    print('A-tier Gold-like prioritisation: ENABLED')
+    print('Dynamic entry-zone status: ENABLED')
+    print('Hybrid exit research v5.1: ENABLED')
+    print('Shock/reversal veto: ENABLED — 5m + 1m opposite impulse protection')
+    print('1m stale-candidate revalidation: ENABLED — fresh 5m thesis required at trigger')
+    print('Zero-confirmation veto: ENABLED — no entry with trend/vol=0 and momentum=0')
+    print('Trading212 margin-sizing guard: ENABLED — stock alerts show NOTIONAL vs margin')
+    print('Safety sweep v5.1: ENABLED — shock veto + stale revalidation + zero-confirmation block + sizing guard')
+    print('Shadow exits: 0.50R / 0.75R / 1.00R / 1.50R / 2.50R')
+    print('IG demo exit policy during research: UNCHANGED — full TP1')
     print(f"Watchlist: {len(cfg['watchlist'])} instruments | min score {cfg['scanner']['minimum_score']} | core interval 5m")
     print('1-minute entry watcher: ENABLED for near-qualified 5m setups')
     print('Auto performance tracker: ENABLED (TP1 / TP2 / stop / expiry)')
@@ -2425,8 +2864,13 @@ def main():
             '🔄 Core strategy: confirmed 5-minute setups\n'
             '👀 1-minute entry watcher: ACTIVE when a setup is close\n'
             '🤖 Auto result tracking: ON (TP1 / TP2 / stop / expiry)\n'
+            '🧪 Hybrid exit research v5.1: 0.50R / 0.75R / 1.00R / 1.50R / 2.50R shadows\n'
+            '🛡️ Shock/reversal + zero-confirmation vetoes: ENABLED\n'
+            '🔄 1m trigger revalidates fresh 5m thesis before alerting\n'
+            '💰 A-TIER research: 70% @ 0.75R + 30% runner to 1.50R; B/B+: full 0.75R\n'
             '✅ Entry ranges: ON | ♻️ Re-entry confirmation: ON\n'
             f'{tracker_summary_line()}\n'
+            f'{exit_research_summary_line()}\n'
             f'{storage_line}\n'
             f'📊 Watchlist: {len(cfg["watchlist"])} instruments\n'
             f'⭐ Minimum score: {cfg["scanner"]["minimum_score"]}/8\n'
@@ -2437,7 +2881,7 @@ def main():
             f'🤖 IG demo auto execution: {"ON" if IG_EXECUTOR.auto else "OFF"}\n'
             f'🧪 Auto markets: {", ".join(sorted(IG_EXECUTOR.allowed_types))} | Max open: {IG_EXECUTOR.max_open}\n'
             f'🛑 Demo daily caps: {IG_EXECUTOR.max_trades_day} trades / {IG_EXECUTOR.max_stops_day} stop-outs\n'
-            f'🎯 Phase-1 IG exit: full position closes at TP1\n'
+            f'🎯 IG DEMO execution exit stays full TP1 while v5 shadows are tested\n'
             f'{IG_EXECUTOR.stats_line()}'
         )
         if telegram_notify(startup_message):
