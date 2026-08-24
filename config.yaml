@@ -4,6 +4,7 @@ scanner:
   max_candle_age_minutes: 20
   index_max_candle_age_minutes: 30
   twelvedata_max_candle_age_minutes: 15
+  entry_watch_ttl_minutes: 4
 
   # Free Twelve Data plan protection:
   # 5 FX/metals symbols x 12 scans/hour x 11 hours = ~660 credits/day (under 800/day).
@@ -12,8 +13,8 @@ scanner:
   twelvedata_sunday_start_hour_uk: 22
 
 risk:
-  account_cash_gbp: 991.46
-  risk_per_trade_pct: 2.00   # ~£19.83 planned loss per trade
+  account_cash_gbp: 987.00
+  risk_per_trade_pct: 1.00   # ~£9.87 scanner risk budget while validating live execution
   max_cash_exposure_pct: 50
   atr_stop_multiple: 1.20
   tp1_r_multiple: 1.50
