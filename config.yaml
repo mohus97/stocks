@@ -9,7 +9,7 @@ scanner:
   entry_watch_ttl_minutes: 4
 
   # Free Twelve Data plan protection:
-  # 5 core FX/commodity symbols x 12 scans/hour x 11 hours = ~660 credits/day (under 800/day).
+  # 4 core FX/metal symbols x 12 scans/hour x 11 hours = ~528 credits/day (under 800/day).
   twelvedata_active_start_hour_uk: 7
   twelvedata_active_end_hour_uk: 18
   twelvedata_sunday_start_hour_uk: 22
@@ -56,10 +56,9 @@ watchlist:
   - {symbol: ^FTSE, name: FTSE 100, type: index}
   - {symbol: ^GDAXI, name: DAX, type: index}
 
-  # Core FX + spot commodities — Twelve Data 5-minute feed.
-  # Kept to 5 symbols so the free 800-credit/day plan covers the main UK day-trading window.
+  # Core FX + Gold — Twelve Data 5-minute feed.
+  # WTI removed because the current Twelve Data plan does not provide WTI/USD.
   - {symbol: GBPUSD, data_symbol: GBP/USD, name: GBP/USD, type: forex, provider: twelvedata}
   - {symbol: EURUSD, data_symbol: EUR/USD, name: EUR/USD, type: forex, provider: twelvedata}
   - {symbol: USDJPY, data_symbol: USD/JPY, name: USD/JPY, type: forex, provider: twelvedata}
   - {symbol: XAUUSD, data_symbol: XAU/USD, name: Gold XAU/USD, type: metal, provider: twelvedata}
-  - {symbol: WTIUSD, data_symbol: WTI/USD, name: WTI Crude Oil, type: commodity, provider: twelvedata}
