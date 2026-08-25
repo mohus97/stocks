@@ -2,7 +2,8 @@
 """Runtime safety overrides for the scanner.
 
 Keeps scanner.py untouched while tightening A-tier classification, improving
-Trading 212 stock-CFD sizing guidance, and making stale-entry rules explicit.
+Trading 212 stock-CFD sizing guidance internally, enforcing stale-entry rules,
+and keeping Telegram trade alerts deliberately compact.
 """
 import math
 import time
@@ -68,6 +69,7 @@ def strict_quality_tier(score, context):
 
 
 def _stock_cfd_unit_guide(sig):
+    """Retained for internal/debug use even though compact Telegram alerts hide it."""
     sym = str(sig.symbol).upper().replace('^','')
     if sig.market_type != 'stock' or sym not in _US_STOCKS:
         return None
@@ -86,35 +88,39 @@ def _stock_cfd_unit_guide(sig):
     if not math.isfinite(units) or units <= 0:
         return None
     return (
-        f"🧮 US-stock CFD guide: max ~{units:.2f} units at this stop "
-        f"(≈£{loss_per_unit_gbp:.2f} loss per 1 unit if stop hits; USD→GBP est {usdgbp:.3f})"
+        f"max ~{units:.2f} units; ≈£{loss_per_unit_gbp:.2f}/unit to stop; USD→GBP {usdgbp:.3f}"
     )
 
 
-_orig_format_1m = scanner.format_1m_signal
-_orig_format_5m = scanner.format_signal
+def _compact_trade_alert(sig):
+    """Only show the fields needed to act quickly; full analytics stay in logs/tracker."""
+    dec = scanner.decimals_for_price(sig.price)
+    tier = (sig.context or {}).get('quality_tier') or scanner.quality_tier(sig.score, sig.context or {})
+    tier_icon = '🔥' if tier == 'A-TIER' else ('⭐' if tier == 'B+' else '⚡')
+    side_icon = '🟢' if sig.side == 'LONG' else '🔴'
 
+    # The scanner's current recommended first cash-out level is +0.75R.
+    tp = scanner._r_target_price(sig.price, sig.stop, sig.side, scanner.HYBRID_BANK_R)
 
-def _harden_message(text, sig):
-    text = text.replace(
-        f"💷 Max planned loss: ~£{sig.risk_gbp:.2f}",
-        f"💷 Scanner risk budget: ~£{sig.risk_gbp:.2f} (broker execution can differ)"
+    symbol = str(sig.symbol).replace('^', '')
+    label = str(sig.label or symbol)
+    name = label if label.upper() == symbol.upper() else f"{label} ({symbol})"
+
+    return (
+        f"🚨 {name}\n"
+        f"{tier_icon} {tier} • {side_icon} {sig.side}\n"
+        f"📍 Entry: {sig.entry_low:.{dec}f} – {sig.entry_high:.{dec}f}\n"
+        f"🎯 TP: {tp:.{dec}f}\n"
+        f"🛑 SL: {sig.stop:.{dec}f}"
     )
-    guide = _stock_cfd_unit_guide(sig)
-    extra = []
-    if guide:
-        extra.append(guide)
-    extra.append("⏱️ ENTRY FRESHNESS: only enter while live bid/ask is still inside the zone; if price has already moved +0.50R toward target, SKIP — no chase.")
-    extra.append("🛑 Before order: verify Trading 212's live P/L-at-stop with your chosen units. If it exceeds the scanner risk budget, reduce units.")
-    return text + "\n" + "\n".join(extra)
 
 
 def format_1m_signal_safe(sig):
-    return _harden_message(_orig_format_1m(sig), sig)
+    return _compact_trade_alert(sig)
 
 
 def format_signal_safe(sig):
-    return _harden_message(_orig_format_5m(sig), sig)
+    return _compact_trade_alert(sig)
 
 
 # Monkey-patch functions looked up dynamically by scanner.py.
