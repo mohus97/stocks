@@ -3,9 +3,10 @@
 
 Keeps scanner.py untouched while tightening A-tier classification, improving
 Trading 212 stock-CFD sizing guidance internally, enforcing stale-entry rules,
-blocking exhausted stock chases after violent moves, and keeping Telegram trade
-alerts deliberately compact. Only A-tier trade alerts are sent to Telegram;
-lower tiers continue to run and be tracked silently.
+blocking exhausted stock chases after violent moves, adding a full-session
+extension/catalyst guard for stocks, and keeping Telegram trade alerts deliberately
+compact. Only A-tier trade alerts are sent to Telegram; lower tiers continue to
+run and be tracked silently.
 """
 import math
 import os
@@ -195,8 +196,6 @@ def _stock_impulse_exhaustion(snap, item):
             f"(rally {rally_atr:.2f} ATR, retrace {long_retrace_atr:.2f} ATR)"
         )
 
-    # Keep metrics in context so the tracker can later tell us whether thresholds
-    # are too strict or too loose without cluttering Telegram alerts.
     snap.setdefault('context', {})['impulse_exhaustion'] = {
         'drop_atr': round(drop_atr, 3),
         'rally_atr': round(rally_atr, 3),
@@ -209,27 +208,155 @@ def _stock_impulse_exhaustion(snap, item):
     return out
 
 
+def _stock_session_extension(snap, item):
+    """Block same-direction stock entries after a highly extended session move.
+
+    This is deliberately price-led rather than dependent on a news API. A large
+    session move, gap, or abnormal volume is treated as a possible catalyst day.
+    The trade is blocked near the session extreme and can become eligible again
+    only after a meaningful pullback; the scanner's normal confirmation rules
+    must then qualify a fresh continuation setup.
+    """
+    if not snap or str((item or {}).get('type', '')).lower() != 'stock':
+        return {'LONG': None, 'SHORT': None}
+
+    d = snap.get('d')
+    atr_v = float(snap.get('atr') or 0.0)
+    if d is None or len(d) < 12 or not math.isfinite(atr_v) or atr_v <= 0:
+        return {'LONG': None, 'SHORT': None}
+
+    completed = d.iloc[:-1].copy()
+    if completed.empty:
+        return {'LONG': None, 'SHORT': None}
+
+    try:
+        idx_utc = scanner.pd.to_datetime(completed.index, utc=True, errors='coerce')
+        valid = ~idx_utc.isna()
+        completed = completed.loc[valid].copy()
+        idx_utc = idx_utc[valid]
+        if completed.empty:
+            return {'LONG': None, 'SHORT': None}
+        ny_dates = idx_utc.tz_convert('America/New_York').date
+        current_date = ny_dates[-1]
+        current_mask = ny_dates == current_date
+        session = completed.loc[current_mask].copy()
+        prior = completed.loc[~current_mask].copy()
+    except Exception:
+        # Yahoo's normal stock feed is timezone-aware, but fail open if an
+        # unexpected index shape appears rather than breaking the whole scanner.
+        return {'LONG': None, 'SHORT': None}
+
+    if len(session) < 4:
+        return {'LONG': None, 'SHORT': None}
+
+    session_open = float(session.iloc[0]['Open'])
+    close = float(session.iloc[-1]['Close'])
+    session_high = float(session['High'].astype(float).max())
+    session_low = float(session['Low'].astype(float).min())
+    if session_open <= 0 or close <= 0:
+        return {'LONG': None, 'SHORT': None}
+
+    move_pct = 100.0 * (close - session_open) / session_open
+    move_atr = (close - session_open) / atr_v
+    long_pullback_atr = max(0.0, (session_high - close) / atr_v)
+    short_pullback_atr = max(0.0, (close - session_low) / atr_v)
+
+    prev_close = None
+    gap_pct = 0.0
+    if not prior.empty:
+        try:
+            prev_close = float(prior.iloc[-1]['Close'])
+            if prev_close > 0:
+                gap_pct = 100.0 * (session_open - prev_close) / prev_close
+        except Exception:
+            prev_close = None
+
+    volume_ratio = 1.0
+    if 'Volume' in completed.columns:
+        try:
+            recent_vol = session['Volume'].astype(float).tail(3)
+            baseline_src = prior['Volume'].astype(float).tail(40) if not prior.empty else session['Volume'].astype(float).iloc[:-3]
+            baseline = float(baseline_src[baseline_src > 0].median()) if len(baseline_src) else 0.0
+            recent = float(recent_vol[recent_vol > 0].mean()) if len(recent_vol) else 0.0
+            if baseline > 0 and recent > 0:
+                volume_ratio = recent / baseline
+        except Exception:
+            volume_ratio = 1.0
+
+    # A plain 3% move needs substantial ATR extension. A smaller move can still
+    # be treated as catalyst-like when accompanied by a large gap or abnormal
+    # volume. These defaults are intentionally conservative for live alerts.
+    catalyst_like = abs(gap_pct) >= 1.50 or volume_ratio >= 2.00
+    extended_up = (
+        (move_pct >= 3.00 and move_atr >= 2.50)
+        or (move_pct >= 2.00 and move_atr >= 2.00 and catalyst_like)
+    )
+    extended_down = (
+        (move_pct <= -3.00 and move_atr <= -2.50)
+        or (move_pct <= -2.00 and move_atr <= -2.00 and catalyst_like)
+    )
+
+    # Do not chase the session extreme. A pullback of at least 0.65 ATR resets
+    # this guard; normal structure/momentum/trigger confirmation is still needed.
+    long_reset = long_pullback_atr >= 0.65
+    short_reset = short_pullback_atr >= 0.65
+
+    out = {'LONG': None, 'SHORT': None}
+    catalyst_bits = []
+    if abs(gap_pct) >= 1.50:
+        catalyst_bits.append(f"gap {gap_pct:+.1f}%")
+    if volume_ratio >= 2.00:
+        catalyst_bits.append(f"volume {volume_ratio:.1f}x")
+    catalyst_text = f"; catalyst flags: {', '.join(catalyst_bits)}" if catalyst_bits else ''
+
+    if extended_up and not long_reset:
+        out['LONG'] = (
+            f"session already extended +{move_pct:.1f}% / +{move_atr:.1f} ATR — wait for pullback "
+            f"({long_pullback_atr:.2f} ATR so far{catalyst_text})"
+        )
+    if extended_down and not short_reset:
+        out['SHORT'] = (
+            f"session already extended {move_pct:.1f}% / {move_atr:.1f} ATR — wait for pullback "
+            f"({short_pullback_atr:.2f} ATR so far{catalyst_text})"
+        )
+
+    snap.setdefault('context', {})['session_extension'] = {
+        'session_move_pct': round(move_pct, 3),
+        'session_move_atr': round(move_atr, 3),
+        'gap_pct': round(gap_pct, 3),
+        'volume_ratio': round(volume_ratio, 3),
+        'long_pullback_atr': round(long_pullback_atr, 3),
+        'short_pullback_atr': round(short_pullback_atr, 3),
+        'catalyst_like': bool(catalyst_like),
+    }
+    return out
+
+
 _orig_decision_snapshot = scanner._decision_snapshot
 _orig_telegram_notify = scanner.telegram_notify
 _orig_ig_ensure_login = scanner.IGDemoExecutor.ensure_login
 
 
 def decision_snapshot_safe(df, item, cfg):
-    """Wrap Decision Engine v2 with a stock-specific anti-chase veto."""
+    """Wrap Decision Engine v2 with stock anti-chase and session-extension vetoes."""
     snap = _orig_decision_snapshot(df, item, cfg)
     if not snap:
         return snap
+
     blocks = _stock_impulse_exhaustion(snap, item)
-    for side, reason in blocks.items():
-        if not reason:
-            continue
-        result = (snap.get('results') or {}).get(side)
-        if not result:
-            continue
-        result['veto'] = True
-        reasons = result.setdefault('veto_reasons', [])
-        if reason not in reasons:
-            reasons.append(reason)
+    session_blocks = _stock_session_extension(snap, item)
+    for side in ('LONG', 'SHORT'):
+        reasons_to_add = [blocks.get(side), session_blocks.get(side)]
+        for reason in reasons_to_add:
+            if not reason:
+                continue
+            result = (snap.get('results') or {}).get(side)
+            if not result:
+                continue
+            result['veto'] = True
+            reasons = result.setdefault('veto_reasons', [])
+            if reason not in reasons:
+                reasons.append(reason)
     return snap
 
 
