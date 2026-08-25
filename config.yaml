@@ -1,5 +1,7 @@
 scanner:
-  minimum_score: 6.0
+  # Tightened after 2026-08-25 review: 6.0/8 setups were being allowed to
+  # graduate into live entries too easily. Require a stronger 5m base score.
+  minimum_score: 6.5
   cooldown_minutes: 30
   max_candle_age_minutes: 20
   index_max_candle_age_minutes: 30
