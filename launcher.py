@@ -8,6 +8,7 @@ alerts deliberately compact. Only A-tier trade alerts are sent to Telegram;
 lower tiers continue to run and be tracked silently.
 """
 import math
+import os
 import time
 
 import scanner
@@ -18,6 +19,7 @@ _US_STOCKS = {
     'SMCI','COIN','MSTR','HOOD','SOFI','RDDT','NFLX','CRWD'
 }
 _fx_cache = {'value': 0.74, 'ts': 0.0}
+_ig_startup_status = {}
 
 
 def _usd_to_gbp():
@@ -209,6 +211,7 @@ def _stock_impulse_exhaustion(snap, item):
 
 _orig_decision_snapshot = scanner._decision_snapshot
 _orig_telegram_notify = scanner.telegram_notify
+_orig_ig_ensure_login = scanner.IGDemoExecutor.ensure_login
 
 
 def decision_snapshot_safe(df, item, cfg):
@@ -245,6 +248,58 @@ def telegram_notify_a_tier_only(text):
     return _orig_telegram_notify(text)
 
 
+def ig_demo_single_login_status():
+    """Avoid IG's old double-login startup flow.
+
+    scanner.main() historically authenticated once for a connectivity test, logged
+    that session out, then immediately authenticated a second time for execution.
+    IG can reject that second rapid login with an invalid-client-security-token 401.
+    Return a shared provisional status object so main performs only the executor
+    login; the ensure_login wrapper below then updates this same object with the
+    real result before startup status is printed or sent to Telegram.
+    """
+    api_key = os.getenv('IG_DEMO_API_KEY', '').strip()
+    identifier = os.getenv('IG_DEMO_IDENTIFIER', '').strip()
+    password = os.getenv('IG_DEMO_PASSWORD', '').strip()
+    auto_flag = os.getenv('IG_AUTO_TRADE', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
+    _ig_startup_status.clear()
+    if not (api_key and identifier and password):
+        _ig_startup_status.update({
+            'ok': False,
+            'configured': False,
+            'auto_requested': auto_flag,
+            'message': 'IG demo credentials missing in Railway variables.',
+        })
+    else:
+        # Provisional True intentionally makes scanner.main() call executor.ensure_login().
+        _ig_startup_status.update({
+            'ok': True,
+            'configured': True,
+            'auto_requested': auto_flag,
+            'message': 'IG demo executor authentication pending.',
+        })
+    return _ig_startup_status
+
+
+def ig_ensure_login_with_status(self):
+    """Authenticate once and keep startup/runtime status aligned with the executor."""
+    ok = bool(_orig_ig_ensure_login(self))
+    if self.configured:
+        _ig_startup_status.update({
+            'ok': ok,
+            'configured': True,
+            'auto_requested': bool(self.auto),
+            'environment': 'DEMO' if ok else None,
+            'account_id': self.account_id,
+            'account_type': self.account_type,
+            'currency': self.currency,
+            'dealing_enabled': bool(self.dealing_enabled),
+            'tokens_ok': bool(self.cst and self.xst),
+            'message': 'IG demo executor connected.' if ok else 'IG demo executor authentication failed.',
+        })
+    return ok
+
+
 def format_1m_signal_safe(sig):
     return _compact_trade_alert(sig)
 
@@ -258,6 +313,8 @@ scanner._gold_like_core = strict_gold_like_core
 scanner.quality_tier = strict_quality_tier
 scanner._decision_snapshot = decision_snapshot_safe
 scanner.telegram_notify = telegram_notify_a_tier_only
+scanner.ig_demo_connection_test = ig_demo_single_login_status
+scanner.IGDemoExecutor.ensure_login = ig_ensure_login_with_status
 scanner.format_1m_signal = format_1m_signal_safe
 scanner.format_signal = format_signal_safe
 
