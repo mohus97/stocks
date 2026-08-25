@@ -4,7 +4,8 @@
 Keeps scanner.py untouched while tightening A-tier classification, improving
 Trading 212 stock-CFD sizing guidance internally, enforcing stale-entry rules,
 blocking exhausted stock chases after violent moves, and keeping Telegram trade
-alerts deliberately compact.
+alerts deliberately compact. Only A-tier trade alerts are sent to Telegram;
+lower tiers continue to run and be tracked silently.
 """
 import math
 import time
@@ -120,8 +121,8 @@ def _stock_impulse_exhaustion(snap, item):
     """Detect when a stock has already moved too far to chase safely.
 
     A violent 5m impulse often produces a snapback even when the higher-timeframe
-    trend is correct.  We block entries near the extreme until price has made a
-    meaningful retrace.  After that retrace, the normal breakout/retest logic may
+    trend is correct. We block entries near the extreme until price has made a
+    meaningful retrace. After that retrace, the normal breakout/retest logic may
     qualify a fresh continuation entry.
     """
     if not snap or str((item or {}).get('type', '')).lower() != 'stock':
@@ -160,7 +161,7 @@ def _stock_impulse_exhaustion(snap, item):
     from_low_atr = max(0.0, (close - low) / atr_v)
     from_high_atr = max(0.0, (high - close) / atr_v)
 
-    # A retrace only counts if it happened AFTER the impulse extreme.  This stops
+    # A retrace only counts if it happened AFTER the impulse extreme. This stops
     # a vertical dump/pump being chased, while allowing a pullback + fresh rejection.
     post_low_high = max(highs[low_i + 1:]) if low_i + 1 < len(highs) else low
     post_high_low = min(lows[high_i + 1:]) if high_i + 1 < len(lows) else high
@@ -207,6 +208,7 @@ def _stock_impulse_exhaustion(snap, item):
 
 
 _orig_decision_snapshot = scanner._decision_snapshot
+_orig_telegram_notify = scanner.telegram_notify
 
 
 def decision_snapshot_safe(df, item, cfg):
@@ -228,6 +230,21 @@ def decision_snapshot_safe(df, item, cfg):
     return snap
 
 
+def telegram_notify_a_tier_only(text):
+    """Suppress B/B+ trade alerts while preserving tracking and non-trade messages.
+
+    Returning True for a suppressed trade is intentional: scanner.py treats a
+    successful delivery as permission to register the signal in the research
+    tracker. This keeps the lower-tier sample running silently in the background.
+    """
+    message = str(text or '')
+    if message.lstrip().startswith('🚨 ') and 'A-TIER' not in message:
+        first_line = message.splitlines()[0] if message else 'trade alert'
+        print(f"Telegram suppressed (non-A-tier): {first_line}")
+        return True
+    return _orig_telegram_notify(text)
+
+
 def format_1m_signal_safe(sig):
     return _compact_trade_alert(sig)
 
@@ -240,6 +257,7 @@ def format_signal_safe(sig):
 scanner._gold_like_core = strict_gold_like_core
 scanner.quality_tier = strict_quality_tier
 scanner._decision_snapshot = decision_snapshot_safe
+scanner.telegram_notify = telegram_notify_a_tier_only
 scanner.format_1m_signal = format_1m_signal_safe
 scanner.format_signal = format_signal_safe
 
