@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runtime entrypoint with a narrow IG index-contract safety patch.
+"""Runtime entrypoint with narrow execution/alert safety patches.
 
 The scanner's index market mapper used minimum point cost as a stronger ranking
 criterion than tradeability. That could select IG's Weekend UK 100 contract on a
@@ -7,6 +7,8 @@ weekday because it was cheaper, even when its status was EDITS_ONLY.
 
 This patch keeps the existing mapper for every non-index market. For indices it
 only considers live TRADEABLE, non-weekend contracts and otherwise fails closed.
+It also makes Telegram trade alerts show both the +0.75R bank target and +1.50R
+runner target so the first partial target is not mistaken for the full TP.
 """
 
 import scanner
@@ -129,6 +131,34 @@ scanner.IGDemoExecutor.search_market = ig_search_market_tradeable_only
 
 # Importing launcher applies the rest of the existing runtime safety overrides.
 import launcher  # noqa: E402
+
+
+def _compact_trade_alert_with_two_targets(sig):
+    """Show the partial-bank and runner targets explicitly in Telegram."""
+    dec = scanner.decimals_for_price(sig.price)
+    tier = (sig.context or {}).get('quality_tier') or scanner.quality_tier(sig.score, sig.context or {})
+    tier_icon = '🔥' if tier == 'A-TIER' else ('⭐' if tier == 'B+' else '⚡')
+    side_icon = '🟢' if sig.side == 'LONG' else '🔴'
+
+    tp1 = scanner._r_target_price(sig.price, sig.stop, sig.side, scanner.HYBRID_BANK_R)
+    tp2 = scanner._r_target_price(sig.price, sig.stop, sig.side, scanner.HYBRID_RUNNER_R)
+
+    symbol = str(sig.symbol).replace('^', '')
+    label = str(sig.label or symbol)
+    name = label if label.upper() == symbol.upper() else f"{label} ({symbol})"
+
+    return (
+        f"🚨 {name}\n"
+        f"{tier_icon} {tier} • {side_icon} {sig.side}\n"
+        f"📍 Entry: {sig.entry_low:.{dec}f} – {sig.entry_high:.{dec}f}\n"
+        f"🎯 TP1: {tp1:.{dec}f} (+0.75R)\n"
+        f"🏁 TP2: {tp2:.{dec}f} (+1.50R)\n"
+        f"🛑 SL: {sig.stop:.{dec}f}"
+    )
+
+
+# launcher.format_signal_safe()/format_1m_signal_safe() resolve this global at call time.
+launcher._compact_trade_alert = _compact_trade_alert_with_two_targets
 
 
 if __name__ == '__main__':
