@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runtime entrypoint with narrow execution/alert safety patches.
+"""Runtime entrypoint with narrow execution/alert/tracking safety patches.
 
 The scanner's index market mapper used minimum point cost as a stronger ranking
 criterion than tradeability. That could select IG's Weekend UK 100 contract on a
@@ -9,6 +9,10 @@ This patch keeps the existing mapper for every non-index market. For indices it
 only considers live TRADEABLE, non-weekend contracts and otherwise fails closed.
 It also makes Telegram trade alerts show both the +0.75R bank target and +1.50R
 runner target so the first partial target is not mistaken for the full TP.
+
+Finally, it starts a clean current-strategy A-tier cohort. Lower tiers and legacy
+signals keep their existing research history, while new A-tier signals are stored
+as a separate cohort so current win/loss/R stats are not polluted by old logic.
 """
 
 import scanner
@@ -161,5 +165,152 @@ def _compact_trade_alert_with_two_targets(sig):
 launcher._compact_trade_alert = _compact_trade_alert_with_two_targets
 
 
+# --- Clean current A-tier cohort -------------------------------------------------
+# Start deliberately from this deployment rather than trying to reinterpret old
+# records. That gives an uncontaminated forward sample under the current filters.
+CURRENT_A_TIER_COHORT = 'a_tier_current_2026_08_27'
+_orig_register_tracked_signal = scanner.register_tracked_signal
+_orig_tracker_summary_line = scanner.tracker_summary_line
+
+
+def _signal_tier(sig):
+    ctx = dict(getattr(sig, 'context', {}) or {})
+    return ctx.get('quality_tier') or scanner.quality_tier(sig.score, ctx)
+
+
+def _register_current_a_tier(sig, item=None):
+    """Register A-tier signals in a clean cohort without lower-tier dedupe pollution.
+
+    Legacy/lower-tier records still use scanner.py's original registration path.
+    A current A-tier is allowed to coexist with an older lower-tier thesis on the
+    same symbol/direction, fixing the old case where a B/B+ record could swallow a
+    later upgraded A-tier alert. True duplicate current A-tier theses are still
+    suppressed while one is active.
+    """
+    tier = _signal_tier(sig)
+    if tier != 'A-TIER':
+        return _orig_register_tracked_signal(sig, item)
+
+    data = scanner.load_tracker()
+    tid = scanner.track_id(sig)
+    if any(r.get('id') == tid for r in data.get('signals', [])):
+        return tid
+
+    active_current = [
+        r for r in data.get('signals', [])
+        if r.get('symbol') == sig.symbol
+        and r.get('side') == sig.side
+        and r.get('strategy_cohort') == CURRENT_A_TIER_COHORT
+        and r.get('status') in {'OPEN', 'TP1_OPEN'}
+    ]
+    if active_current:
+        existing = active_current[-1]
+        print(
+            f'[{scanner.datetime.now().strftime("%H:%M:%S")}] tracker: '
+            f'current A-tier duplicate suppressed {sig.symbol} {sig.side}; '
+            f'active #{existing.get("id", "?")}'
+        )
+        return existing.get('id')
+
+    provider = (item or {}).get('provider', 'yahoo')
+    data_symbol = (item or {}).get('data_symbol', sig.symbol)
+    ctx = dict(getattr(sig, 'context', {}) or {})
+    ctx['quality_tier'] = tier
+    ctx['strategy_cohort'] = CURRENT_A_TIER_COHORT
+
+    plan = scanner.exit_research_plan(tier)
+    shadow_exits = {
+        f'{r:.2f}': {'target_r': float(r), 'status': 'OPEN', 'result_r': 0.0, 'hit_at': None}
+        for r in scanner.SHADOW_EXIT_LEVELS_R
+    }
+    recommended_exit = dict(plan)
+    recommended_exit.update({
+        'status': 'OPEN', 'result_r': 0.0,
+        'bank_hit_at': None, 'closed_at': None,
+    })
+
+    rec = {
+        'id': tid,
+        'symbol': sig.symbol,
+        'label': sig.label,
+        'market_type': sig.market_type,
+        'provider': provider,
+        'data_symbol': data_symbol,
+        'side': sig.side,
+        'entry': sig.price,
+        'entry_low': sig.entry_low,
+        'entry_high': sig.entry_high,
+        'stop': sig.stop,
+        'tp1': sig.tp1,
+        'tp2': sig.tp2,
+        'score': sig.score,
+        'risk_gbp': sig.risk_gbp,
+        'created_at': sig.timestamp,
+        'status': 'OPEN',
+        'last_checked_bar': None,
+        'tp1_hit_at': None,
+        'closed_at': None,
+        'result_r': 0.0,
+        'max_favorable_r': 0.0,
+        'max_adverse_r': 0.0,
+        'reentry_armed_at': None,
+        'reentry_alerted_at': None,
+        'decision_engine': ctx.get('engine', 'v1'),
+        'session': ctx.get('session'),
+        'regime_15m': ctx.get('regime_15m'),
+        'regime_1h': ctx.get('regime_1h'),
+        'atr_value': ctx.get('atr_value'),
+        'atr_percentile': ctx.get('atr_percentile'),
+        'trend_strength': ctx.get('trend_strength'),
+        'nearest_resistance_atr': ctx.get('nearest_resistance_atr'),
+        'nearest_support_atr': ctx.get('nearest_support_atr'),
+        'score_components': ctx.get('score_components'),
+        'quality_tier': tier,
+        'gold_like_core': ctx.get('gold_like_core'),
+        'trigger_mode': ctx.get('trigger_mode'),
+        'trigger_body_ratio': ctx.get('trigger_body_ratio'),
+        'strategy_cohort': CURRENT_A_TIER_COHORT,
+        'exit_research_version': scanner.EXIT_RESEARCH_VERSION,
+        'shadow_exits': shadow_exits,
+        'recommended_exit': recommended_exit,
+    }
+
+    data.setdefault('signals', []).append(rec)
+    scanner.save_tracker(data)
+    print(
+        f'[{scanner.datetime.now().strftime("%H:%M:%S")}] tracker: '
+        f'registered CURRENT A-TIER {sig.symbol} {sig.side} #{tid}'
+    )
+    return tid
+
+
+def _current_a_tier_summary_line(data=None):
+    data = data or scanner.load_tracker()
+    rows = [
+        r for r in data.get('signals', [])
+        if r.get('strategy_cohort') == CURRENT_A_TIER_COHORT
+    ]
+    win_statuses = {'TP1_OPEN', 'TP1_ONLY', 'TP2_HIT'}
+    wins = sum(1 for r in rows if r.get('status') in win_statuses)
+    losses = sum(1 for r in rows if r.get('status') == 'STOPPED')
+    open_n = sum(1 for r in rows if r.get('status') in {'OPEN', 'TP1_OPEN'})
+    resolved = wins + losses
+    wr = f'{100.0 * wins / resolved:.0f}%' if resolved else 'n/a'
+    total_r = sum(float(r.get('result_r', 0.0) or 0.0) for r in rows)
+    return (
+        f'🔥 Current A-tier: {wins}W / {losses}L | Win rate {wr} | '
+        f'Total {total_r:+.1f}R | Open {open_n} | Sample {len(rows)}'
+    )
+
+
+def _tracker_summary_with_current(data=None):
+    return _orig_tracker_summary_line(data) + '\n' + _current_a_tier_summary_line(data)
+
+
+scanner.register_tracked_signal = _register_current_a_tier
+scanner.tracker_summary_line = _tracker_summary_with_current
+
+
 if __name__ == '__main__':
+    print(f'Current A-tier cohort tracker: ENABLED ({CURRENT_A_TIER_COHORT})')
     launcher.scanner.main()
