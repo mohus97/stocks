@@ -15,8 +15,8 @@ scanner:
   twelvedata_sunday_start_hour_uk: 22
 
 risk:
-  account_cash_gbp: 987.00
-  risk_per_trade_pct: 1.00   # ~£9.87 scanner risk budget while validating live execution
+  account_cash_gbp: 1002.00
+  risk_per_trade_pct: 1.00   # ~£10.02 scanner risk budget while validating live execution
   max_cash_exposure_pct: 50
   atr_stop_multiple: 1.20
   tp1_r_multiple: 1.50
