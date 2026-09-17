@@ -28,7 +28,7 @@ notifications:
 
 reliability:
   enabled: true
-  allow_fast: false
+  allow_fast: true  # User-approved filtered B+ Telegram alerts alongside A-tier.
   max_active_signals: 3
   max_active_per_type: 2
   max_total_risk_pct: 2.0
