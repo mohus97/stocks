@@ -38,6 +38,9 @@ reliability:
   max_signal_minutes: 180
   td_daily_credits: 800
   td_minute_credits: 8
+  monitor_reserve_minutes: 30
+  telegram_controls: true
+  report_slippage_r: 0.10  # Sensitivity assumption, NOT measured execution slippage.
 
 news:
   poll_seconds: 120
