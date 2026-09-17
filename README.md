@@ -44,8 +44,11 @@ Fresh available closes in the entry minute can now generate stop warnings.
 Historical extremes in that partially elapsed candle still cannot manufacture
 a win/loss, a crossing time or a broker fill.
 
-- A-tier entries only by default. FAST B+ entries require explicit opt-in with
-  `reliability.allow_fast`; cash-index levels are blocked in both tiers because
+- A-tier and filtered B+ alerts are enabled with the user's approval through
+  `reliability.allow_fast: true`. B+ Telegram alerts are labelled **SPECULATIVE**:
+  score at least 6.5, immediate 1m/5m confirmation, minimum structure/trend/momentum
+  checks and at most 0.15R estimated spread. Setting this flag to false restores
+  A-tier-only alerts. Cash-index levels are blocked in both tiers because
   their Trading 212 CFD price basis has not been verified.
 - Closed, correctly bucketed 5m/15m/1h candles; incomplete aggregates and gaps
   cannot contribute an apparent higher-timeframe trend. Entries must retain

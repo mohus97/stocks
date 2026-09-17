@@ -264,3 +264,37 @@ def test_opposite_short_breakout_failure(engine, signal, clock):
     engine.process_prices(rec['id'], frame('2026-09-17 12:01',
         [(100.6,100.9,100.5,100.7),(100.7,101,100.6,100.8),(100.8,101,100.7,100.8)]))
     assert engine.records(False)[0]['status'] == 'INVALIDATED'
+
+
+def test_filtered_bplus_is_delivered_with_speculative_label(engine, signal, cfg):
+    assert cfg['reliability']['allow_fast'] is True
+    signal.score = 6.5
+    signal.context.update(quality_tier='B+', score_components={
+        'trigger_1m': 1.0, 'setup_5m': 0.5, 'structure_location': 1.0,
+        'trend_volatility': 0.5, 'momentum_quality': 0.5})
+    rec = publish(engine, signal)
+    assert rec['status'] == 'OPEN'
+    assert 'B+ · SPECULATIVE' in engine.sent[0]
+    assert rec['tp1'] == 101.0 and rec['tp2'] == 102.0
+    assert 'TP1 (70%): 101.00' in engine.sent[0]
+    assert rec['risk_gbp'] <= cfg['risk']['account_cash_gbp'] * .01
+
+
+@pytest.mark.parametrize('failure', ['disabled','score','confirmation','structure','momentum','spread'])
+def test_bplus_optin_does_not_bypass_quality_or_spread(engine, signal, failure, monkeypatch):
+    import spread_runtime
+    signal.score = 6.5
+    signal.context.update(quality_tier='B+', score_components={
+        'trigger_1m': 1.0, 'setup_5m': 0.5, 'structure_location': 1.0,
+        'trend_volatility': 0.5, 'momentum_quality': 0.5})
+    if failure == 'disabled': engine.settings['allow_fast'] = False
+    if failure == 'score': signal.score = 6.49
+    if failure == 'confirmation': signal.context['score_components']['trigger_1m'] = 0
+    if failure == 'structure': signal.context['score_components']['structure_location'] = 0.5
+    if failure == 'momentum': signal.context['score_components']['momentum_quality'] = 0
+    if failure == 'spread':
+        original = spread_runtime._spread_profile
+        monkeypatch.setattr(spread_runtime, '_spread_profile', lambda sig: dict(original(sig), spread_r=0.16))
+    engine.publish(signal, {'symbol':signal.symbol,'type':'stock'})
+    engine.deliver_once()
+    assert not engine.sent and not engine.records(False)

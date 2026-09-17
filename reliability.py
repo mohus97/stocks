@@ -105,8 +105,9 @@ def format_trade(rec):
     from scanner import decimals_for_price
     d = decimals_for_price(rec['price'])
     ctx = rec['context']
+    tier_label = 'B+ · SPECULATIVE' if ctx['quality_tier'] == 'B+' else ctx['quality_tier']
     return (
-        f"🚨 {rec['label']} · {rec['side']} · {ctx['quality_tier']}\n"
+        f"🚨 {rec['label']} · {rec['side']} · {tier_label}\n"
         f"ID: {rec['id']}\n"
         f"New-entry deadline: {(parse_time(rec['created_at']) + timedelta(minutes=2)):%H:%M:%S} UTC\n"
         f"Entry: {rec['entry_low']:.{d}f}–{rec['entry_high']:.{d}f}\n"
@@ -597,6 +598,7 @@ class ReliableScanner:
         self.review_news()
         self.system_notice('startup:' + self.clock().isoformat(),
             '✅ Scanner upgrade online: entry-minute stop warnings, persistent position tracking, prioritised risk checks.\n'
+            f"Alerts: {'A-tier + filtered B+ (SPECULATIVE)' if self.settings.get('allow_fast', False) else 'A-tier only'}.\n"
             'Checks: news every 120s; active prices about every 60s when feeds/quota allow. These are not guaranteed delivery times.\n'
             'Use /help for /entered, /skipped, /closed, /status and /report. Controls only update tracking; no broker orders are changed.')
         workers = [
