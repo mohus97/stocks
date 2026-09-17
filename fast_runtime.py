@@ -201,10 +201,4 @@ scanner.register_tracked_signal = _register_fast_metadata
 
 
 if __name__ == '__main__':
-    print(
-        f'FAST intraday alerts: ENABLED — B+ 15-60m lane | '
-        f'min score {FAST_MIN_SCORE:.1f} | max spread {FAST_MAX_SPREAD_R:.2f}R | '
-        f'targets {FAST_TP1_R:.2f}R/{FAST_TP2_R:.2f}R | indices disabled '
-        f'({FAST_MODE_VERSION})'
-    )
     launcher.scanner.main()

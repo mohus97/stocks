@@ -1,0 +1,9 @@
+.git
+.env
+__pycache__
+.pytest_cache
+*.sqlite3*
+event_cache.json
+scanner_performance.json
+.scanner_state.json
+reliability.lock

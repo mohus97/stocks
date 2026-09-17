@@ -1,4 +1,9 @@
-# 5-minute Telegram Market Scanner — Cloud Setup
+# Telegram Market Scanner — Cloud Setup
+
+> The active runtime now uses news-aware reliability safeguards. Read
+> [README.md](README.md) for the current alert rules, monitoring latency,
+> persistence, and rollout procedure. The older settings below describe the
+> original scanner and are retained only as setup history.
 
 This version is designed to stay online when your Mac is off. It runs continuously in a cloud worker and scans the configured watchlist every 5 minutes.
 
