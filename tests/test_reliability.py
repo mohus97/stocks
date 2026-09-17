@@ -107,7 +107,7 @@ def test_expired_unsent_signal_never_becomes_a_trade(engine, signal, clock, monk
 def test_final_price_recheck_rejects_failed_breakout(engine, signal, clock, monkeypatch):
     engine.publish(signal, {'symbol': 'NVDA', 'type': 'stock'})
     monkeypatch.setattr(engine, '_pending_is_valid', ReliableScanner._pending_is_valid.__get__(engine))
-    monkeypatch.setattr(engine, 'fetch_monitor_frame', lambda rec: frame('2026-09-17 12:00', [(99.3,99.6,99.2,99.4)]))
+    monkeypatch.setattr(engine, 'fetch_monitor_frame', lambda rec, **kw: frame('2026-09-17 12:00', [(99.3,99.6,99.2,99.4)]))
     engine.deliver_once()
     assert not engine.sent and engine.records(False)[0]['status'] == 'UNSENT'
 
@@ -195,8 +195,8 @@ def test_shared_credit_limits_and_daily_restart(engine, clock, cfg, tmp_path):
     assert restored.reserve_td(1, 'monitor')
     with restored.db:
         restored.db.execute('INSERT INTO credits VALUES (?,?,?)', (clock().timestamp()-60,790,'core'))
-    assert not restored.reserve_td(1, 'monitor')  # Core scans retain a reserve.
-    assert restored.reserve_td(1, 'core')
+    assert restored.reserve_td(1, 'monitor')  # Risk checks may use the final credit.
+    assert not restored.reserve_td(1, 'core')
     clock.advance(86400)
     assert restored.reserve_td(4, 'core')
     restored.db.close()

@@ -7,6 +7,43 @@ orders. The historical research files and legacy demo code remain separate.
 
 ## Behavior
 
+### Tracking controls (upgrade v2)
+
+In the existing Telegram bot, reply to a delivered alert with `/entered`
+(optionally `/entered 123.45` with your actual fill price), `/skipped`, or
+`/closed`. Alternatively include the full alert ID, e.g. `/entered ID 123.45`.
+`/closed` means you already fully closed it yourself. These commands record
+your actions; **they never submit, modify or close broker orders**.
+
+An alert and a user-confirmed open position have separate lifecycles. News
+withdrawals, target outcomes, invalidations and the three-hour alert expiry do
+not close a marked-open position. Its available-price stop checks and news
+warnings continue until `/closed`, subject to the remaining quota and provider
+availability. Actual fill size, partial closes, broker stops and account P&L
+are not reconciled. Existing broker trades and legacy alerts are not imported.
+Unmarked alerts still receive normal hypothetical monitoring.
+
+`/status` shows worker health, event coverage and marked-open positions.
+`/report` shows completed eligible reference-price outcomes, unscored states,
+results by setup, and cumulative closed-outcome drawdown. It subtracts recorded
+spread estimates and a configurable **assumed** 0.10R slippage sensitivity;
+this is not measured execution slippage or an actual-account equity curve.
+Excluding withdrawals and uncertain paths can bias the scored sample. No edge
+or win rate is claimed before there are eligible outcomes.
+
+Commands are accepted only from the configured Telegram chat and its matching
+private-chat user. Group chats additionally require explicitly configured
+`TELEGRAM_ALLOWED_USER_IDS` (comma-separated numeric sender IDs). First enablement
+baselines the old update queue rather than executing historical commands.
+Subsequent offsets, tracking changes and acknowledgements are committed together
+and survive restarts. Commands older than 15 minutes are rejected. Existing
+webhooks are left untouched: a conflict pauses new alerts and produces a worker
+warning rather than deleting somebody else's integration. `/help` lists formats.
+
+Fresh available closes in the entry minute can now generate stop warnings.
+Historical extremes in that partially elapsed candle still cannot manufacture
+a win/loss, a crossing time or a broker fill.
+
 - A-tier entries only by default. FAST B+ entries require explicit opt-in with
   `reliability.allow_fast`; cash-index levels are blocked in both tiers because
   their Trading 212 CFD price basis has not been verified.
@@ -40,12 +77,18 @@ orders. The historical research files and legacy demo code remain separate.
 
 World and business reporting comes from the Guardian's
 [world RSS](https://www.theguardian.com/world/rss) and
-[business RSS](https://www.theguardian.com/business/rss). Additional public
+[business RSS](https://www.theguardian.com/business/rss), with independent
+[BBC world](https://feeds.bbci.co.uk/news/world/rss.xml) and
+[BBC business](https://feeds.bbci.co.uk/news/business/rss.xml) feeds. At least one
+fresh feed in each category must work. Individual outages generate reduced-coverage
+warnings, even if the other publisher provides coverage. Additional public
 feeds cover [Fed monetary policy](https://www.federalreserve.gov/feeds/feeds.htm),
 [ECB announcements](https://www.ecb.europa.eu/rss/press.html), and
 [Bank of England news](https://www.bankofengland.co.uk/rss/news).
 [Forex Factory's weekly JSON export](https://www.forexfactory.com/calendar)
 provides the high-impact economic calendar. No news API key is needed.
+An unavailable Fed/BoE/ECB feed blocks new entries with the corresponding
+USD/GBP/EUR exposure; quiet but successfully fetched central-bank feeds are valid.
 
 Source URLs and publication/event times are retained. Missing timestamps,
 future stories, old headlines, invalid feeds, and stale calendar weeks cannot
@@ -73,10 +116,14 @@ out-of-sample evaluation.
 
 The configured Twelve Data limits are 800 credits/day and 8/minute, shared
 across core scans, final entry checks, and monitoring. Each symbol costs a
-credit. Credits are persisted with UTC day boundaries and remaining core scans
-are reserved. **The free budget cannot support continuous 1m FX/gold monitoring
+credit. Credits are persisted with UTC day boundaries. Discovery and final-entry
+checks reserve 30 minutes of credits per active FX/gold instrument, plus a share
+of the minute budget for risk checks. Marked-open positions are fetched before
+other alert scenarios. Risk checks can use the remaining budget even when new
+discovery is paused, and are not cut off by the discovery session's end time.
+**The free budget cannot support continuous 1m FX/gold monitoring
 throughout every session.** When it is exhausted, 1m checks warn as degraded;
-scheduled core scans still review the 5m thesis and news checks continue. New
+core scans may also pause for quota, while news checks continue. New
 FX/gold entries cannot pass their final 1m check without fresh data/credits.
 
 ## Persistence and delivery
@@ -85,7 +132,8 @@ Mount Railway's existing volume at `/data`, or set `SCANNER_DATA_DIR` to a
 persistent writable directory. New files are:
 
 - `reliable_signals.sqlite3` (+ SQLite WAL/SHM): proposals, delivered alerts,
-  lifecycle state, notification outbox, and shared Twelve Data credits.
+  lifecycle state, notification outbox, shared Twelve Data credits, marked
+  positions, and Telegram update offset. The migration only adds tables.
 - `event_cache.json`: last successful event data and feed-health timestamps.
 - `reliability.lock`: single-process ownership of the alert worker.
 
@@ -105,6 +153,17 @@ they are not actual fills/P&L. Partial exits are weighted and gap losses can
 exceed 1R. Old `scanner_performance.json` statistics are preserved, not silently
 rewritten, and their unverified alerts are not imported into the new ledger.
 Existing broker positions need manual review during this migration.
+
+### Operational health
+
+Every 60 seconds the service logs a secret-free `SCANNER_HEALTH` JSON heartbeat.
+It includes worker freshness (including the main scan loop), required-feed
+failures, individual-source degradation, marked-open count and notification
+retry/backlog indicators. A stopped main loop blocks new entries after seven
+minutes without progress. Transport errors log exception types, never API URLs.
+An independent ChatGPT hourly Railway watchdog can check these logs even if the
+process is dead; this is an hourly operational backstop, not an instant pager.
+Neither it nor the internal risk workers guarantee continuous market coverage.
 
 ## Install and verify
 

@@ -115,7 +115,8 @@ def format_trade(rec):
         f"Estimated risk: £{rec['risk_gbp']:.2f}; notional cap £{rec['suggested_exposure_gbp']:.2f}\n"
         f"Spread estimate: {ctx['spread_r']:.2f}R — verify broker bid/ask and size.\n"
         "News/calendar checked. Enter only inside the range.\n"
-        "Monitoring alerts follow this ID; no orders are placed or closed."
+        "Monitoring alerts follow this ID; no orders are placed or closed.\n"
+        f"Record your action: /entered {rec['id']} [fill price], /skipped {rec['id']} or /closed {rec['id']}"
     )
 
 
@@ -171,13 +172,30 @@ class ReliableScanner:
                 attempts INTEGER NOT NULL DEFAULT 0, due REAL NOT NULL, message_id INTEGER);
             CREATE TABLE IF NOT EXISTS credits (at REAL NOT NULL, count INTEGER NOT NULL, purpose TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS credit_time ON credits(at);
+            CREATE TABLE IF NOT EXISTS positions (signal_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         ''')
         self.db.commit()
         self.frames = {}
         self.news = news or NewsGuard(cfg.get('news', {}), self.folder / 'event_cache.json', clock=self.clock)
         self.stop_event = threading.Event()
         self.threads = []
-        self.health = {}
+        self.health = {'core': self.clock().isoformat()}
+        self.command_client = None
+
+    def watched_records(self):
+        """Alert lifecycle and user-confirmed position lifecycle are independent."""
+        with self.lock:
+            rows = self.db.execute("""SELECT s.body FROM signals s LEFT JOIN positions p
+                ON s.id=p.signal_id WHERE s.status IN ('PENDING','DELIVERY_UNKNOWN','OPEN','TP1_OPEN')
+                OR p.status='ENTERED'""").fetchall()
+            return [json.loads(r['body']) for r in rows]
+
+    def open_positions(self):
+        with self.lock:
+            return {r['signal_id']: json.loads(r['body']) for r in
+                    self.db.execute("SELECT * FROM positions WHERE status='ENTERED'").fetchall()}
 
     def records(self, active_only=True):
         with self.lock:
@@ -212,13 +230,17 @@ class ReliableScanner:
             limit = self.settings.get('td_daily_credits', 800)
             minute_limit = self.settings.get('td_minute_credits', 8)
             reserve = 0
-            if purpose != 'core':
-                from scanner import UK
-                local = now.astimezone(UK)
-                remaining_hours = max(0, self.cfg['scanner'].get('twelvedata_active_end_hour_uk', 18) - local.hour - local.minute / 60)
-                instruments = sum(i.get('provider') == 'twelvedata' for i in self.cfg['watchlist'])
-                reserve = math.ceil(remaining_hours * 12) * instruments + 20
-            if used + count + reserve > limit or used_min + count > minute_limit:
+            # Active risk checks take precedence over looking for new entries.
+            active = {r['symbol'] for r in self.watched_records()
+                      if r.get('delivered_at') and r['item'].get('provider') == 'twelvedata'}
+            minute_reserve = 0
+            if purpose not in {'monitor', 'position'}:
+                reserve = len(active) * self.settings.get('monitor_reserve_minutes', 30)
+                # Once risk workers have used their reserved share this minute,
+                # the remainder is available to setup discovery.
+                spent = self.db.execute("SELECT COALESCE(SUM(count),0) FROM credits WHERE at>=? AND purpose IN ('monitor','position')", (minute,)).fetchone()[0]
+                minute_reserve = max(0, len(active) - spent)
+            if used + count + reserve > limit or used_min + count + minute_reserve > minute_limit:
                 return False
             self.db.execute('INSERT INTO credits VALUES (?,?,?)', (now.timestamp(), count, purpose))
             self.db.execute('DELETE FROM credits WHERE at < ?', (day - 86400,))
@@ -247,7 +269,7 @@ class ReliableScanner:
         with self.lock, self.db:
             if self.db.execute('SELECT 1 FROM signals WHERE id=?', (rec['id'],)).fetchone():
                 return False
-            active = self.records()
+            active = self.watched_records()
             if any(r['symbol'] == sig.symbol for r in active):
                 return False
             if len(active) >= self.settings.get('max_active_signals', 3):
@@ -322,19 +344,30 @@ class ReliableScanner:
                 self.system_notice('news-down:' + now.isoformat(), '⚠️ News/calendar coverage unavailable: ' + ', '.join(missing) + '. New trade alerts paused; price monitoring continues.')
             elif was_degraded:
                 self.system_notice('news-up:' + now.isoformat(), '✅ News/calendar coverage restored. Qualified entries may resume outside event blackout windows.')
+        degraded_sources = tuple(self.news.degraded_sources(now))
+        previous_sources = self.health.get('degraded_sources', ())
+        if degraded_sources != previous_sources:
+            self.health['degraded_sources'] = degraded_sources
+            self.system_notice('sources:' + now.isoformat(),
+                '⚠️ Reduced event coverage: ' + ', '.join(degraded_sources) + '. Required coverage rules still apply.'
+                if degraded_sources else '✅ All configured news sources are reachable again.')
         with self.lock, self.db:
-            for rec in self.records():
+            for rec in self.watched_records():
                 risks = self.news.risks(rec['item'], now)
                 if risks:
                     event = risks[0]
                     reason = (f"Event risk: {event.title}\n{event.source}: {event.url}\n"
                               "Previous entry withdrawn. Review open exposure; wait for a new confirmed setup.")
-                    self._transition(rec, 'NEWS_WITHDRAWN', reason, event.id)
+                    if rec['status'] in ACTIVE:
+                        self._transition(rec, 'NEWS_WITHDRAWN', reason, event.id)
+                    else:
+                        self._queue(f"position-news:{rec['id']}:{event.id}", self._update_message(rec,
+                            reason + '\nYour marked-open position remains monitored until /closed.'), rec['id'])
 
-    def fetch_monitor_frame(self, rec):
+    def fetch_monitor_frame(self, rec, purpose='monitor'):
         from scanner import fetch_twelvedata_1m, fetch_yahoo_1m
         if rec['item'].get('provider') == 'twelvedata':
-            config = dict(self.cfg, _td_purpose='monitor')
+            config = dict(self.cfg, _td_purpose=purpose)
             return fetch_twelvedata_1m(SimpleNamespace(data_symbol=rec['item'].get('data_symbol', rec['symbol'])), config)
         return fetch_yahoo_1m(rec['item'].get('data_symbol', rec['symbol']))
 
@@ -345,7 +378,7 @@ class ReliableScanner:
             return False
         if self.threads and not self.workers_ready():
             return False
-        frame = self.fetch_monitor_frame(rec)
+        frame = self.fetch_monitor_frame(rec, purpose='entry')
         if not fresh_frame(frame, 2, self.clock()):
             return False
         price = float(frame.iloc[-1].Close)
@@ -444,11 +477,14 @@ class ReliableScanner:
             # A current observed stop breach warrants an immediate warning even
             # before candle close, but must not fabricate a precise fill/P&L.
             latest = clean_frame(frame).iloc[-1]
-            if latest.name >= start:
+            # Do not reuse OHLC extremes from before delivery for P&L. A fresh
+            # available CLOSE in the entry minute can nevertheless warrant a
+            # risk warning; candle timestamps are opens, not quote timestamps.
+            if latest.name >= pd.Timestamp(rec['delivered_at']).floor('min'):
                 price = float(latest.Close)
                 breached = price <= rec['stop'] if rec['side'] == 'LONG' else price >= rec['stop']
                 if breached:
-                    self._transition(rec, 'INVALIDATED', 'Latest observed price crossed the stop. Do not use this setup; check the broker immediately.')
+                    self._transition(rec, 'INVALIDATED', 'Latest available price is beyond the stop. Do not use this setup; check the broker immediately. The exact crossing time and fill are unverified.')
                     return
             tail = bars.loc[bars.index >= start].tail(2)
             trigger = rec['context']['trigger_level']
@@ -470,21 +506,69 @@ class ReliableScanner:
 
     def monitor_once(self):
         now = self.clock()
-        active = [r for r in self.records() if r.get('delivered_at')]
+        positions = self.open_positions()
+        active = [r for r in self.watched_records() if r.get('delivered_at')]
+        active.sort(key=lambda r: (r['id'] not in positions, r.get('created_at', '')))
+        # Process marked-open positions first, so candidates cannot race them
+        # for the last credits. Limits keep this list small.
         with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = [(r, pool.submit(self.fetch_monitor_frame, r)) for r in active]
-            for rec, future in futures:
-                try:
-                    self.process_prices(rec['id'], future.result())
-                except Exception as exc:
-                    LOG.warning('Monitor %s failed (%s)', rec['symbol'], type(exc).__name__)
-                    self.process_prices(rec['id'], None)
+            for batch in ([r for r in active if r['id'] in positions], [r for r in active if r['id'] not in positions]):
+                futures = [(r, pool.submit(self.fetch_monitor_frame, r)) for r in batch]
+                for rec, future in futures:
+                    try:
+                        frame = future.result()
+                        self.process_prices(rec['id'], frame)
+                        self.process_position_prices(rec, frame)
+                    except Exception as exc:
+                        LOG.warning('Monitor %s failed (%s)', rec['symbol'], type(exc).__name__)
+                        self.process_prices(rec['id'], None)
+                        self.process_position_prices(rec, None)
         with self.lock, self.db:
             for rec in self.records():
                 origin = rec.get('delivered_at') or rec['created_at']
                 limit = self.settings.get('max_signal_minutes', 180) if rec.get('delivered_at') else 2
                 if (now - parse_time(origin)).total_seconds() >= limit * 60:
                     self._transition(rec, 'EXPIRED', 'Signal time limit reached. Entry withdrawn; no flat-price or profitable exit is assumed.')
+
+    def process_position_prices(self, rec, frame):
+        """Never infer a broker close from a quote or signal expiry."""
+        with self.lock, self.db:
+            row = self.db.execute("SELECT body FROM positions WHERE signal_id=? AND status='ENTERED'", (rec['id'],)).fetchone()
+            if not row:
+                return
+            pos = json.loads(row['body'])
+            healthy = fresh_frame(frame, 2, self.clock())
+            if not healthy:
+                if not pos.get('degraded'):
+                    self._queue('position-data:' + rec['id'] + ':' + self.clock().isoformat(),
+                        self._update_message(rec, 'Your marked-open position has stale/missing prices or no API credits. Monitor it at the broker; tracking has NOT closed your position.'), rec['id'])
+                pos['degraded'] = True
+            else:
+                if pos.get('degraded'):
+                    self._queue('position-data-up:' + rec['id'] + ':' + self.clock().isoformat(),
+                        self._update_message(rec, 'Fresh data restored for your marked-open position.'), rec['id'])
+                pos['degraded'] = False
+                pos['last_price_check'] = self.clock().isoformat()
+                latest = clean_frame(frame).iloc[-1]
+                if latest.name >= pd.Timestamp(pos['entered_at']).floor('min'):
+                    price = float(latest.Close)
+                    breached = price <= rec['stop'] if rec['side'] == 'LONG' else price >= rec['stop']
+                    if breached and not pos.get('stop_warned'):
+                        pos['stop_warned'] = True
+                        self._queue('position-stop:' + rec['id'], self._update_message(rec,
+                            'Your marked-open position is beyond the original stop on the available feed. Check the broker now. It stays marked open until you send /closed ' + rec['id']), rec['id'])
+            self.db.execute('UPDATE positions SET body=? WHERE signal_id=?', (json.dumps(pos), rec['id']))
+
+    def heartbeat_once(self):
+        now = self.clock()
+        with self.lock:
+            oldest = self.db.execute("SELECT MIN(due) FROM outbox WHERE status='PENDING'").fetchone()[0]
+            retries = self.db.execute("SELECT COALESCE(MAX(attempts),0) FROM outbox WHERE status='PENDING'").fetchone()[0]
+        LOG.info('SCANNER_HEALTH %s', json.dumps({'version': 2, 'at': now.isoformat(),
+            'workers_ready': self.workers_ready(), 'required_feeds_missing': self.news.unavailable(now),
+            'degraded_sources': self.news.degraded_sources(now), 'marked_open': len(self.open_positions()),
+            'max_pending_delivery_attempts': retries,
+            'outbox_overdue_seconds': max(0, now.timestamp() - oldest) if oldest else 0}, sort_keys=True))
 
     def _loop(self, name, interval, action):
         while not self.stop_event.is_set():
@@ -497,7 +581,9 @@ class ReliableScanner:
             self.stop_event.wait(interval)
 
     def workers_ready(self):
-        limits = {'news': 60, 'prices': self.settings.get('monitor_seconds', 60) + 90, 'delivery': 90}
+        limits = {'news': 60, 'prices': self.settings.get('monitor_seconds', 60) + 90, 'delivery': 90, 'core': 420}
+        if self.command_client is not None:
+            limits['commands'] = 90
         return all(self.health.get(name) and
                    (self.clock() - parse_time(self.health[name])).total_seconds() < limit
                    for name, limit in limits.items())
@@ -510,13 +596,19 @@ class ReliableScanner:
         self.news.refresh()
         self.review_news()
         self.system_notice('startup:' + self.clock().isoformat(),
-            '✅ Reliable scanner online: A-tier entries, news/calendar pauses, active invalidation alerts.\n'
+            '✅ Scanner upgrade online: entry-minute stop warnings, persistent position tracking, prioritised risk checks.\n'
             'Checks: news every 120s; active prices about every 60s when feeds/quota allow. These are not guaranteed delivery times.\n'
-            'Legacy statistics are retained separately; this ledger tracks new delivered alerts. No broker orders are changed.')
-        for name, interval, action in (
+            'Use /help for /entered, /skipped, /closed, /status and /report. Controls only update tracking; no broker orders are changed.')
+        workers = [
                 ('news', 10, lambda: (self.news.refresh(), self.review_news())),
                 ('prices', self.settings.get('monitor_seconds', 60), self.monitor_once),
-                ('delivery', 2, self.deliver_once)):
+                ('delivery', 2, self.deliver_once)]
+        if self.settings.get('telegram_controls', True):
+            from scanner_controls import TelegramControls
+            self.command_client = TelegramControls(self)
+            workers.append(('commands', 5, self.command_client.poll))
+        workers.append(('heartbeat', 60, self.heartbeat_once))
+        for name, interval, action in workers:
             thread = threading.Thread(target=self._loop, args=(name, interval, action), name='scanner-' + name, daemon=True)
             thread.start()
             self.threads.append(thread)

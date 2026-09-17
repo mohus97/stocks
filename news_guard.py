@@ -24,6 +24,8 @@ UTC = timezone.utc
 DEFAULT_FEEDS = (
     ('world', 'https://www.theguardian.com/world/rss'),
     ('business', 'https://www.theguardian.com/business/rss'),
+    ('bbc_world', 'https://feeds.bbci.co.uk/news/world/rss.xml'),
+    ('bbc_business', 'https://feeds.bbci.co.uk/news/business/rss.xml'),
     ('fed', 'https://www.federalreserve.gov/feeds/press_monetary.xml'),
     ('ecb', 'https://www.ecb.europa.eu/rss/press.html'),
     ('boe', 'https://www.bankofengland.co.uk/rss/news'),
@@ -202,11 +204,11 @@ class NewsGuard:
             response = self.get(url, timeout=(3, 8), headers={'User-Agent': 'MarketScanner/2.0 (RSS event risk monitor)'})
             response.raise_for_status()
             events = parse_calendar(response.json(), now) if name == 'calendar' else parse_rss(response.content, name, url)
-            if name in {'world', 'business'} and not any(
+            if name in {'world', 'business', 'bbc_world', 'bbc_business'} and not any(
                     timedelta(minutes=-2) <= now - parse_time(e.at) <= timedelta(hours=12) for e in events):
                 raise ValueError('news feed publication times are stale')
             return events
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=8) as pool:
             results = [(name, pool.submit(fetch, (name, url))) for name, url in due]
             for name, result in results:
                 self._accept_result(name, result, now)
@@ -236,15 +238,30 @@ class NewsGuard:
             backoff = 300 if name == 'calendar' else 60
             self.attempts[name] = now.timestamp() - max(0, interval - backoff)
 
+    def degraded_sources(self, now=None):
+        """Connectivity freshness, not the age of the last central-bank story."""
+        now = now or self.clock()
+        with self.lock:
+            missing = []
+            for source in [name for name, _ in self.feeds] + ['calendar']:
+                maximum = self.cfg.get('calendar_max_age_seconds', 7200) if source == 'calendar' else self.cfg.get('max_age_seconds', 600)
+                last = self.success.get(source)
+                if not last or not 0 <= (now - parse_time(last)).total_seconds() <= maximum:
+                    missing.append(source)
+            return missing
+
     def unavailable(self, now=None):
         now = now or self.clock()
         missing = []
         with self.lock:
             # A quiet central bank feed is normal. General coverage + calendar
             # must both be working; a single surviving feed is not full coverage.
+            degraded = self.degraded_sources(now)
             for source in ('world', 'business', 'calendar'):
                 maximum = self.cfg.get('calendar_max_age_seconds', 7200) if source == 'calendar' else self.cfg.get('max_age_seconds', 600)
                 last = self.success.get(source)
+                if source in {'world', 'business'} and source in degraded and 'bbc_' + source not in degraded and 'bbc_' + source in dict(self.feeds):
+                    continue  # Independent coverage of the same category.
                 if not last or not 0 <= (now - parse_time(last)).total_seconds() <= maximum:
                     missing.append(source)
                 elif source == 'calendar':
@@ -274,6 +291,12 @@ class NewsGuard:
         unavailable = self.unavailable(now)
         if unavailable:
             return 'event coverage unavailable: ' + ', '.join(unavailable)
+        currencies = instrument_currencies(item)
+        missing = self.degraded_sources(now)
+        relevant_missing = [s for s, c in (('fed', 'USD'), ('boe', 'GBP'), ('ecb', 'EUR'))
+                            if s in missing and c in currencies]
+        if relevant_missing:
+            return 'central-bank coverage unavailable: ' + ', '.join(relevant_missing)
         risks = self.risks(item, now)
         if risks:
             return risks[0].title

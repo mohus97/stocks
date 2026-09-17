@@ -1142,6 +1142,7 @@ def fetch_twelvedata_batch(items, cfg):
 
         if not r.ok or (isinstance(data, dict) and data.get('status') == 'error'):
             msg = data.get('message', r.text[:220]) if isinstance(data, dict) else r.text[:220]
+            msg = str(msg).replace(key, '[redacted]')
             print(f'[{datetime.now().strftime("%H:%M:%S")}] Twelve Data batch error: {msg}')
             return {i['symbol']: None for i in items}
 
@@ -1164,19 +1165,20 @@ def fetch_twelvedata_batch(items, cfg):
                     payload = data
 
             if isinstance(payload, dict) and payload.get('status') == 'error':
-                print(f'[{datetime.now().strftime("%H:%M:%S")}] {ds}: Twelve Data error: {payload.get("message", "unknown error")}')
+                safe_message = str(payload.get('message', 'unknown error')).replace(key, '[redacted]')
+                print(f'[{datetime.now().strftime("%H:%M:%S")}] {ds}: Twelve Data error: {safe_message}')
                 out[item['symbol']] = None
             else:
                 out[item['symbol']] = _twelvedata_frame(payload)
         return out
     except Exception as e:
-        print(f'[{datetime.now().strftime("%H:%M:%S")}] Twelve Data batch fetch failed: {e}')
+        print(f'[{datetime.now().strftime("%H:%M:%S")}] Twelve Data batch fetch failed: {type(e).__name__}')
         return {i['symbol']: None for i in items}
 
 
 def fetch_twelvedata_1m(candidate, cfg):
     key = os.getenv('TWELVE_DATA_API_KEY', '').strip()
-    if not key or not twelve_data_active(cfg):
+    if not key or (cfg.get('_td_purpose') not in {'monitor', 'position'} and not twelve_data_active(cfg)):
         return None
     if RELIABILITY and not RELIABILITY.reserve_td(1, cfg.get('_td_purpose', 'watcher')):
         return None
@@ -1199,11 +1201,12 @@ def fetch_twelvedata_1m(candidate, cfg):
             return None
         if not r.ok or (isinstance(data, dict) and data.get('status') == 'error'):
             msg = data.get('message', r.text[:180]) if isinstance(data, dict) else r.text[:180]
+            msg = str(msg).replace(key, '[redacted]')
             print(f'[{datetime.now().strftime("%H:%M:%S")}] {candidate.data_symbol}: Twelve Data 1m error: {msg}')
             return None
         return _twelvedata_frame_min_rows(data, 5)
     except Exception as e:
-        print(f'[{datetime.now().strftime("%H:%M:%S")}] {candidate.data_symbol}: Twelve Data 1m fetch failed: {e}')
+        print(f'[{datetime.now().strftime("%H:%M:%S")}] {candidate.data_symbol}: Twelve Data 1m fetch failed: {type(e).__name__}')
         return None
 
 
@@ -2989,6 +2992,7 @@ def run_reliable(cfg):
     print('Only A-tier entries enabled.' if not cfg.get('reliability', {}).get('allow_fast', False) else 'A-tier and filtered FAST entries enabled.')
     try:
         _, armed = scan_once(cfg, include_twelvedata=False)
+        RELIABILITY.health['core'] = datetime.now(timezone.utc).isoformat()
         last_bucket = int(time.time() // 300)
         while True:
             time.sleep(seconds_to_next_minute())
@@ -2999,6 +3003,7 @@ def run_reliable(cfg):
                     last_bucket = bucket
                 else:
                     armed = watch_1m_entries(cfg, armed)
+                RELIABILITY.health['core'] = datetime.now(timezone.utc).isoformat()
             except Exception as exc:
                 logging.error('Core scan failed (%s); risk workers continue', type(exc).__name__)
                 RELIABILITY.system_notice('scan-error:' + datetime.now(timezone.utc).strftime('%Y-%m-%dT%H'),

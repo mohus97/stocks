@@ -10,7 +10,8 @@ def main():
         guard = NewsGuard({}, Path(folder) / 'events.json')
         guard.refresh()
         missing = guard.unavailable()
-        for name in ('world', 'business', 'fed', 'ecb', 'boe', 'calendar'):
+        missing += [s for s in ('fed', 'ecb', 'boe') if s in guard.degraded_sources()]
+        for name in [name for name, _ in guard.feeds] + ['calendar']:
             print(f'{name}: {"OK" if name in guard.success else "UNAVAILABLE"}')
         print('Required coverage:', 'PAUSED: ' + ', '.join(missing) if missing else 'READY')
         return 1 if missing else 0

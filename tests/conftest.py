@@ -49,7 +49,7 @@ def cfg():
 @pytest.fixture
 def engine(tmp_path, cfg, clock, monkeypatch):
     news = NewsGuard(cfg['news'], tmp_path / 'news.json', clock=clock)
-    news.success = {s: clock().isoformat() for s in ('world', 'business', 'calendar')}
+    news.success = {s: clock().isoformat() for s in [name for name, _ in news.feeds] + ['calendar']}
     sent = []
     def notify(text):
         sent.append(text)
