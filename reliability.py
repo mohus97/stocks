@@ -399,6 +399,7 @@ class ReliableScanner:
                     if rec['status'] == 'DELIVERY_UNKNOWN':
                         rec['status'] = 'OPEN'
                     self._save(rec)  # Never resurrect a concurrently withdrawn setup.
+            LOG.info('Telegram accepted notification %s (message_id=%s)', row['id'], int(message_id))
 
     def process_prices(self, ident, frame):
         now = self.clock()
