@@ -3,9 +3,9 @@ scanner:
   # graduate into live entries too easily. Require a stronger 5m base score.
   minimum_score: 6.5
   cooldown_minutes: 30
-  max_candle_age_minutes: 20
-  index_max_candle_age_minutes: 30
-  twelvedata_max_candle_age_minutes: 15
+  max_candle_age_minutes: 7
+  index_max_candle_age_minutes: 7
+  twelvedata_max_candle_age_minutes: 7
   entry_watch_ttl_minutes: 4
 
   # Free Twelve Data plan protection:
@@ -25,6 +25,28 @@ risk:
 notifications:
   macos: false
   telegram: true
+
+reliability:
+  enabled: true
+  allow_fast: false
+  max_active_signals: 3
+  max_active_per_type: 2
+  max_total_risk_pct: 2.0
+  max_spread_r: 0.20
+  monitor_seconds: 60
+  entry_delivery_ttl_seconds: 45
+  max_signal_minutes: 180
+  td_daily_credits: 800
+  td_minute_credits: 8
+
+news:
+  poll_seconds: 120
+  max_age_seconds: 600
+  calendar_poll_seconds: 3600
+  calendar_max_age_seconds: 7200
+  before_minutes: 30
+  after_minutes: 45
+  headline_pause_minutes: 45
 
 watchlist:
   # US stocks — Yahoo 5-minute data

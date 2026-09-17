@@ -16,10 +16,12 @@ import requests
 import yfinance as yf
 import yaml
 from dotenv import load_dotenv
+from market_data import clean_frame, closed_bars, continuous_tail, fresh_frame, resample_closed
 
 BASE = Path(__file__).resolve().parent
 load_dotenv(BASE / '.env')
 UK = ZoneInfo('Europe/London')
+RELIABILITY = None
 
 
 @dataclass
@@ -962,7 +964,9 @@ def rsi(close, period=14):
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = -delta.clip(upper=0).rolling(period).mean()
     rs = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    result = 100 - (100 / (1 + rs))
+    result = result.mask((loss == 0) & (gain > 0), 100.0)
+    return result.mask((loss == 0) & (gain == 0), 50.0)
 
 
 def atr(df, period=14):
@@ -1011,6 +1015,7 @@ def fetch_yahoo(symbol):
                 auto_adjust=True,
                 prepost=False,
                 threads=False,
+                timeout=10,
             )
             df = normalize_columns(df)
             if df is not None and not df.empty:
@@ -1038,6 +1043,7 @@ def fetch_yahoo_1m(symbol):
             auto_adjust=True,
             prepost=False,
             threads=False,
+            timeout=10,
         )
         df = normalize_columns(df)
         if df is None or df.empty:
@@ -1105,6 +1111,9 @@ def fetch_twelvedata_batch(items, cfg):
     if not twelve_data_active(cfg):
         print(f'[{datetime.now().strftime("%H:%M:%S")}] Twelve Data: session paused to protect free API quota')
         return {i['symbol']: None for i in items}
+    if RELIABILITY and not RELIABILITY.reserve_td(len(items), 'core'):
+        print('Twelve Data: shared minute/day budget exhausted; no request sent')
+        return {i['symbol']: None for i in items}
 
     data_symbols = [i.get('data_symbol', i['symbol']) for i in items]
     requested = ','.join(data_symbols)
@@ -1168,6 +1177,8 @@ def fetch_twelvedata_batch(items, cfg):
 def fetch_twelvedata_1m(candidate, cfg):
     key = os.getenv('TWELVE_DATA_API_KEY', '').strip()
     if not key or not twelve_data_active(cfg):
+        return None
+    if RELIABILITY and not RELIABILITY.reserve_td(1, cfg.get('_td_purpose', 'watcher')):
         return None
     try:
         r = requests.get(
@@ -1254,7 +1265,7 @@ def data_is_fresh(df, item, cfg):
         max_age = float(sc.get('index_max_candle_age_minutes', 30))
     else:
         max_age = float(sc.get('max_candle_age_minutes', 20))
-    return -2 <= age_minutes <= max_age
+    return fresh_frame(df, max_age)
 
 
 def make_entry_zone(entry_price, stop_price, cfg):
@@ -1271,17 +1282,7 @@ def make_entry_zone(entry_price, stop_price, cfg):
 
 
 def _resample_ohlc(df, rule):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    d = df.copy()
-    agg = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
-    if 'Volume' in d.columns:
-        agg['Volume'] = 'sum'
-    try:
-        out = d.resample(rule, label='right', closed='right').agg(agg)
-    except Exception:
-        return pd.DataFrame()
-    return out.dropna(subset=['Open', 'High', 'Low', 'Close'])
+    return resample_closed(df, rule)
 
 
 def _regime_from_frame(frame, timeframe):
@@ -1421,7 +1422,7 @@ def _one_minute_opposite_shock(df1m, side, atr_v, live_price):
     """
     if df1m is None or len(df1m) < 5 or not np.isfinite(atr_v) or atr_v <= 0:
         return False, ''
-    completed = df1m.iloc[:-1].tail(15)
+    completed = closed_bars(df1m, 1).tail(15)
     target_dir = 'DOWN' if str(side).upper() == 'LONG' else 'UP'
     for i in range(len(completed)-1, -1, -1):
         r = completed.iloc[i]
@@ -1449,12 +1450,20 @@ def _decision_snapshot(df, item, cfg):
     """Return independent Decision Engine v2 components for LONG and SHORT."""
     if df is None or len(df) < 65:
         return None
-    d = df.copy()
+    d = clean_frame(df)
+    if d.empty or not data_is_fresh(d, item, cfg):
+        return None
     d['EMA9'] = ema(d['Close'], 9)
     d['EMA20'] = ema(d['Close'], 20)
     d['EMA50'] = ema(d['Close'], 50)
     d['RSI'] = rsi(d['Close'], 14)
     d['ATR'] = atr(d, 14)
+    completed = closed_bars(d, 5)
+    if len(completed) < 64 or not continuous_tail(completed, 5):
+        return None
+    # Preserve the legacy snapshot contract: closed history followed by one
+    # quote row. A feed need not include an unfinished candle to be usable.
+    d = pd.concat([completed, d.iloc[[-1]]])
     row = d.iloc[-2]
     prev = d.iloc[-3]
     live = d.iloc[-1]
@@ -1598,6 +1607,8 @@ def _decision_snapshot(df, item, cfg):
 
     context = {
         'engine': 'v2',
+        'setup_bar': row.name.isoformat(),
+        'quote_bar': live.name.isoformat(),
         'session': _session_bucket(row.name),
         'regime_15m': reg15['name'], 'regime_15m_strength': round(reg15['strength'], 3),
         'regime_1h': reg1h['name'], 'regime_1h_strength': round(reg1h['strength'], 3),
@@ -1717,6 +1728,10 @@ def score_signal(df, item, cfg):
         return None
     _, side, side_result = max(candidates, key=lambda x: x[0])
 
+    trigger_level = float(prev['High'] if side == 'LONG' else prev['Low'])
+    if (side == 'LONG' and live_price <= trigger_level) or (side == 'SHORT' and live_price >= trigger_level):
+        return None
+
     # Decision Engine v2 deliberately chases less than v1.
     trigger_close = float(row['Close'])
     if abs(live_price - trigger_close) > 0.60 * atr_v:  # Aggressive v2: looser direct anti-chase tolerance
@@ -1750,6 +1765,8 @@ def score_signal(df, item, cfg):
     context['veto_reasons'] = list(side_result['veto_reasons'])
     context['quality_tier'] = quality_tier(float(side_result['score']), context)
     context['gold_like_core'] = _gold_like_core(context)
+    context['trigger_level'] = trigger_level
+    context['trigger_mode'] = '5m_breakout'
     return Signal(
         symbol=item['symbol'], label=item.get('name', item['symbol']), market_type=item.get('type', 'stock'),
         side=side, price=float(price), stop=float(stop), tp1=float(tp1), tp2=float(tp2),
@@ -1789,6 +1806,7 @@ def candidate_from_5m(df, item, cfg):
     context['veto_reasons'] = list(side_result['veto_reasons'])
     context['gold_like_core'] = _gold_like_core(context)
     context['quality_tier'] = quality_tier(float(score), context)
+    context['trigger_level'] = float(trigger)
     return Candidate(
         symbol=item['symbol'], label=item.get('name', item['symbol']), market_type=item.get('type', 'stock'),
         provider=item.get('provider', 'yahoo'), data_symbol=item.get('data_symbol', item['symbol']), side=side,
@@ -1924,7 +1942,7 @@ def _revalidate_armed_candidate_5m(c, cfg):
     item = next((i for i in cfg.get('watchlist', []) if i.get('symbol') == c.symbol), None)
     if item is None:
         return False, 'watchlist item missing', None
-    fresh = fetch_item(item, cfg)
+    fresh = RELIABILITY.cached_frame(c.symbol) if RELIABILITY else fetch_item(item, cfg)
     if fresh is None or not data_is_fresh(fresh, item, cfg):
         return False, 'fresh 5m revalidation unavailable/stale', None
     snap = _decision_snapshot(fresh, item, cfg)
@@ -1962,7 +1980,7 @@ def watch_1m_entries(cfg, armed):
             remaining.pop(symbol, None); continue
         try:
             if c.provider == 'twelvedata':
-                allowed, used, budget = consume_td_watch_credit(state, cfg)
+                allowed, used, budget = (True, 0, 0) if RELIABILITY else consume_td_watch_credit(state, cfg)
                 if not allowed:
                     print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m watcher paused — Twelve Data daily watcher budget {budget} used')
                     continue
@@ -1973,7 +1991,12 @@ def watch_1m_entries(cfg, armed):
             if df is None or len(df) < 4:
                 print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m watcher data unavailable'); continue
 
-            bar = df.iloc[-2]; prev = df.iloc[-3]; live = df.iloc[-1]
+            completed = closed_bars(df, 1)
+            if not fresh_frame(df, 2) or not continuous_tail(completed, 1):
+                remaining.pop(symbol, None); continue
+            bar = completed.iloc[-1]; prev = completed.iloc[-2]; live = df.iloc[-1]
+            if pd.Timestamp(bar.name).timestamp() + 60 <= c.armed_at:
+                continue  # Never trigger on a candle that closed before arming.
             close=float(bar['Close']); op=float(bar['Open']); high=float(bar['High']); low=float(bar['Low'])
             prev_close=float(prev['Close']); prev_high=float(prev['High']); prev_low=float(prev['Low'])
             live_price=float(live['Close']); rng=max(high-low, 1e-12); body=abs(close-op); body_ratio=body/rng
@@ -1990,6 +2013,9 @@ def watch_1m_entries(cfg, armed):
                 too_far = c.trigger_level - live_price > 0.33 * c.atr_value
 
             triggered = breakout_now or retest_hold
+            retains_breakout = live_price > c.trigger_level if c.side == 'LONG' else live_price < c.trigger_level
+            if not retains_breakout:
+                continue
             if not triggered:
                 print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m watcher armed {c.side} @ {c.trigger_level:.5f}; waiting'); continue
             if not quality:
@@ -2017,9 +2043,29 @@ def watch_1m_entries(cfg, armed):
             }
             if fresh_snap:
                 trigger_meta['trigger_revalidation_shock'] = fresh_snap.get('context', {}).get('recent_shock_direction')
+                # Use the revalidated thesis, not the old candidate's score/risk.
+                fresh_result = fresh_snap['results'][c.side]
+                c.score = float(fresh_result['score'])
+                c.atr_value = float(fresh_snap['atr'])
+                c.anchor_close = float(fresh_snap['close'])
+                c.recent_low = float(fresh_snap['d']['Low'].iloc[-10:-1].min())
+                c.recent_high = float(fresh_snap['d']['High'].iloc[-10:-1].max())
+                c.context = dict(fresh_snap['context'])
+                c.context['score_components'] = dict(fresh_result['components'])
+                c.context['trigger_level'] = c.trigger_level
+            trigger_meta['trigger_bar'] = bar.name.isoformat()
+            trigger_meta['quote_bar'] = live.name.isoformat()
             sig = build_signal_from_candidate(c, live_price, cfg, trigger_meta=trigger_meta)
             if not sig:
                 remaining.pop(symbol, None); continue
+            if sig.score < float(cfg['scanner']['minimum_score']):
+                remaining.pop(symbol, None); continue
+
+            if RELIABILITY:
+                item = next(i for i in cfg['watchlist'] if i['symbol'] == sig.symbol)
+                RELIABILITY.publish(sig, item)
+                remaining.pop(symbol, None)
+                continue
 
             sig_id = signature(sig); key=f'{symbol}:{sig.side}'; last=state.get(key,{})
             if (now_ts-last.get('time',0)) < cooldown_min*60 and last.get('signature') == sig_id:
@@ -2757,6 +2803,8 @@ def scan_once(cfg, include_twelvedata=True):
             if df is None:
                 print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: insufficient/unavailable data')
                 continue
+            if RELIABILITY:
+                RELIABILITY.observe_5m(df, item)
             if not data_is_fresh(df, item, cfg):
                 age = candle_age_minutes(df)
                 age_txt = f'{age:.1f}m old' if age is not None else 'unknown age'
@@ -2765,7 +2813,11 @@ def scan_once(cfg, include_twelvedata=True):
 
             # Track outcomes of previously-issued signals using the same completed
             # 5-minute data already fetched for this symbol (no extra API credits).
-            update_tracked_signals_for_symbol(df, item, cfg)
+            if RELIABILITY:
+                if RELIABILITY.news.gate(item):
+                    continue
+            else:
+                update_tracked_signals_for_symbol(df, item, cfg)
 
             sig = score_signal(df, item, cfg)
             if not sig:
@@ -2777,6 +2829,10 @@ def scan_once(cfg, include_twelvedata=True):
                     blocked_reason = _near_setup_block_reason(df, item, cfg)
                     suffix = f' — {blocked_reason}' if blocked_reason else ''
                     print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: no confirmed setup{suffix}')
+                continue
+
+            if RELIABILITY:
+                RELIABILITY.publish(sig, item)
                 continue
 
             sig_id = signature(sig)
@@ -2823,6 +2879,8 @@ def seconds_to_next_5m():
 
 def main():
     cfg = load_config()
+    if cfg.get('reliability', {}).get('enabled', True):
+        return run_reliable(cfg)
     td_key = bool(os.getenv('TWELVE_DATA_API_KEY', '').strip())
     ig_status = ig_demo_connection_test()
     global IG_EXECUTOR
@@ -2918,6 +2976,37 @@ def main():
         except KeyboardInterrupt:
             print('\nStopped.')
             break
+
+
+def run_reliable(cfg):
+    import logging
+    from reliability import ReliableScanner
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    global RELIABILITY
+    RELIABILITY = ReliableScanner(cfg, storage_dir())
+    RELIABILITY.start()
+    print('Reliable scanner: news-aware, durable alert tracking, independent risk monitor; alert-only.')
+    print('Only A-tier entries enabled.' if not cfg.get('reliability', {}).get('allow_fast', False) else 'A-tier and filtered FAST entries enabled.')
+    try:
+        _, armed = scan_once(cfg, include_twelvedata=False)
+        last_bucket = int(time.time() // 300)
+        while True:
+            time.sleep(seconds_to_next_minute())
+            try:
+                bucket = int(time.time() // 300)
+                if bucket != last_bucket:
+                    _, armed = scan_once(cfg, include_twelvedata=True)
+                    last_bucket = bucket
+                else:
+                    armed = watch_1m_entries(cfg, armed)
+            except Exception as exc:
+                logging.error('Core scan failed (%s); risk workers continue', type(exc).__name__)
+                RELIABILITY.system_notice('scan-error:' + datetime.now(timezone.utc).strftime('%Y-%m-%dT%H'),
+                    '⚠️ Core scan failed. Existing alerts remain under independent monitoring; no new setup is inferred from missing data.')
+    except KeyboardInterrupt:
+        print('Stopped.')
+    finally:
+        RELIABILITY.stop()
 
 
 if __name__ == '__main__':
