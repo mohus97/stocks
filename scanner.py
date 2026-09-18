@@ -1996,6 +1996,9 @@ def watch_1m_entries(cfg, armed):
 
             completed = closed_bars(df, 1)
             if not fresh_frame(df, 2) or not continuous_tail(completed, 1):
+                age = candle_age_minutes(df)
+                age_txt = f'{age:.1f}m' if age is not None else 'unknown'
+                print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: 1m watcher cancelled — data age {age_txt}, continuous closed candles={continuous_tail(completed, 1)}')
                 remaining.pop(symbol, None); continue
             bar = completed.iloc[-1]; prev = completed.iloc[-2]; live = df.iloc[-1]
             if pd.Timestamp(bar.name).timestamp() + 60 <= c.armed_at:
@@ -2817,7 +2820,11 @@ def scan_once(cfg, include_twelvedata=True):
             # Track outcomes of previously-issued signals using the same completed
             # 5-minute data already fetched for this symbol (no extra API credits).
             if RELIABILITY:
-                if RELIABILITY.news.gate(item):
+                news_reason = RELIABILITY.news.gate(item)
+                if news_reason:
+                    # One line per symbol/5m scan explains otherwise silent pauses.
+                    safe_reason = ' '.join(str(news_reason).split())[:300]
+                    print(f'[{datetime.now().strftime("%H:%M:%S")}] {symbol}: entry paused by news — {safe_reason}')
                     continue
             else:
                 update_tracked_signals_for_symbol(df, item, cfg)
