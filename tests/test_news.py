@@ -94,3 +94,22 @@ def test_week_rollover_requires_current_calendar(engine, clock):
     engine.news.success = {s:clock().isoformat() for s in ('world','business')}
     engine.news.success['calendar'] = '2026-09-20T03:45:00+00:00'  # Saturday.
     assert engine.news.unavailable() == ['calendar']
+
+
+@pytest.mark.parametrize('item', [
+    {'symbol': 'NVDA', 'type': 'stock', 'name': 'NVIDIA'},
+    {'symbol': 'EURUSD', 'type': 'forex'},
+    {'symbol': 'XAUUSD', 'type': 'metal'},
+])
+@pytest.mark.parametrize('title,blocked', [
+    ('Early voting begins in midterms as campaign shifts focus to cost of living and Iran war – US politics live', False),
+    ('Voters debate the cost of the Ukraine war', False),
+    ('Iran launches attacks on shipping', True),
+    ('China imposes blockade on Taiwan', True),
+    ('Iran declares war', True),
+    ('War escalates in Ukraine', True),
+])
+def test_background_war_mentions_vs_conflict_developments(engine, clock, item, title, blocked):
+    e = event(clock, title)
+    engine.news.events = {e.id: e}
+    assert bool(engine.news.gate(item)) is blocked

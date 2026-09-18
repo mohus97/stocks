@@ -134,8 +134,11 @@ def headline_relevant(event, item):
     if re.search(r'\b(invasion|invades|air ?strikes?|missile strikes?|nuclear attack|strait of hormuz|'
                  r'banking crisis|emergency rate|oil embargo|trade war|ceasefire|cease-fire|tariffs?)\b', title):
         return True
+    # A country plus a background mention of "war" is not a fresh shock.
+    # Keep concrete conflict actions and explicit outbreak/escalation language.
     if re.search(r'\b(iran|israel|russia|ukraine|china|taiwan)\b', title) and re.search(
-            r'\b(attacks?|strikes?|bombing|bombardment|war|blockade|invasion)\b', title):
+            r'\b(attacks?|strikes?|bombing|bombardment|blockade|invasion|'
+            r'(?:declares?|declared|declaration of) war|war (?:begins|erupts|breaks out|escalates|widens|spreads))\b', title):
         return True
     economic = re.search(r'\b(interest rates?|rate (cut|rise|hike|decision)|inflation|cpi|payrolls?|'
                          r'jobs report|monetary policy|fomc|economic recession)\b', title)
