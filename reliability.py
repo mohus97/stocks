@@ -96,7 +96,7 @@ def prepare_signal(sig, cfg):
     ctx.update({'exit_plan': '70_30_original_stop', 'bank_fraction': 0.70,
                 'tp1_r': tp1_r, 'tp2_r': tp2_r, 'spread_r': spread_r,
                 'spread_source': profile['source'], 'spread_price_units': profile['spread'],
-                'risk_budget_gbp': budget, 'sizing_is_estimate': True})
+                'risk_budget_gbp': budget, 'sizing_is_estimate': True, 'lifecycle_version': 3})
     sig.context = ctx
     return sig, None
 
@@ -113,10 +113,12 @@ def format_trade(rec):
         f"Entry: {rec['entry_low']:.{d}f}–{rec['entry_high']:.{d}f}\n"
         f"TP1 (70%): {rec['tp1']:.{d}f} · TP2 (30%): {rec['tp2']:.{d}f}\n"
         f"Stop for remaining position: {rec['stop']:.{d}f}\n"
+        f"Reference-plan time limit: {rec.get('horizon_minutes', 180)} minutes after delivery.\n"
         f"Estimated risk: £{rec['risk_gbp']:.2f}; notional cap £{rec['suggested_exposure_gbp']:.2f}\n"
         f"Spread estimate: {ctx['spread_r']:.2f}R — verify broker bid/ask and size.\n"
         "News/calendar checked. Enter only inside the range.\n"
-        "Monitoring alerts follow this ID; no orders are placed or closed.\n"
+        "Risk warnings withdraw new entry permission; the original stop/target scenario keeps tracking.\n"
+        "No orders are placed or closed.\n"
         f"Record your action: /entered {rec['id']} [fill price], /skipped {rec['id']} or /closed {rec['id']}"
     )
 
@@ -266,7 +268,8 @@ class ReliableScanner:
         rec = asdict(sig)
         rec.update(id=signal_key(sig), item=dict(item), status='PENDING',
                    created_at=self.clock().isoformat(), delivered_at=None, result_r=None,
-                   last_bar=None, tp1_at=None, monitoring_degraded=False)
+                   last_bar=None, tp1_at=None, monitoring_degraded=False,
+                   horizon_minutes=self.settings.get('max_signal_minutes', 180))
         with self.lock, self.db:
             if self.db.execute('SELECT 1 FROM signals WHERE id=?', (rec['id'],)).fetchone():
                 return False
@@ -292,21 +295,41 @@ class ReliableScanner:
         return False
 
     def _update_message(self, rec, reason):
-        return (f"⚠️ {rec['label']} · {rec['side']} · {rec['status']}\nID: {rec['id']}\n"
+        label = 'ENTRY WITHDRAWN · PLAN TRACKED' if rec.get('entry_withdrawn') and rec['status'] in ACTIVE else rec['status']
+        return (f"⚠️ {rec['label']} · {rec['side']} · {label}\nID: {rec['id']}\n"
                 f"Observed: {self.clock():%Y-%m-%d %H:%M:%S} UTC\n"
                 f"{reason}\nNo broker order has been changed. Actual fills/P&L may differ.")
 
     def _transition(self, rec, status, reason, event_id=None):
         previous = rec['status']
         rec.update(status=status, reason=reason, closed_at=self.clock().isoformat())
-        if status not in {'STOPPED', 'TP2_HIT'} or rec.get('monitor_gap') or not rec.get('message_id'):
+        if status not in {'STOPPED', 'TP2_HIT', 'TIME_EXIT'} or rec.get('monitor_gap') or rec.get('path_uncertain') or not rec.get('message_id'):
             rec['result_r'] = None
         rec['result_r_net_estimate'] = (rec['result_r'] - rec['context'].get('spread_r', 0)
                                         if rec['result_r'] is not None else None)
+        LOG.info('SIGNAL_TRANSITION %s', json.dumps({'id': rec['id'], 'symbol': rec['symbol'],
+            'status': status, 'reason': reason, 'gross_r': rec.get('result_r'),
+            'after_spread_r': rec.get('result_r_net_estimate'), 'tp1_at': rec.get('tp1_at'),
+            'lifecycle_version': rec['context'].get('lifecycle_version', 'legacy')}))
         self._save(rec)
         self.db.execute("UPDATE outbox SET status='CANCELLED' WHERE signal_id=? AND kind='ENTRY' AND status='PENDING'", (rec['id'],))
         if rec.get('delivered_at') or previous == 'DELIVERY_UNKNOWN':
             self._queue(f"update:{rec['id']}:{event_id or status}", self._update_message(rec, reason), rec['id'])
+
+    def _warn(self, rec, code, reason):
+        """Revoke new-entry permission without censoring the fixed-exit scenario."""
+        warnings = rec.setdefault('risk_warnings', {})
+        if code in warnings:
+            self._save(rec)
+            return
+        warnings[code] = {'at': self.clock().isoformat(), 'reason': reason}
+        rec['entry_withdrawn'] = True
+        self._save(rec)
+        self.db.execute("UPDATE outbox SET status='CANCELLED' WHERE signal_id=? AND kind='ENTRY' AND status='PENDING'", (rec['id'],))
+        LOG.info('SIGNAL_WARNING %s', json.dumps({'id': rec['id'], 'symbol': rec['symbol'], 'code': code, 'reason': reason}))
+        self._queue('risk:' + rec['id'] + ':' + code, self._update_message(rec,
+            'RISK WARNING: ' + reason + '\nDo not enter from the old alert. Review open exposure at your broker. '
+            'The original stop/target scenario remains tracked for evaluation; this warning is not a recorded exit.'), rec['id'])
 
     def observe_5m(self, frame, item):
         from scanner import _decision_snapshot
@@ -328,11 +351,16 @@ class ReliableScanner:
                     continue
                 side = snap['results'][rec['side']]
                 opposite = snap['results']['SHORT' if rec['side'] == 'LONG' else 'LONG']
-                # Falling score alone is not proof of a mistake. Require a hard
-                # veto or a materially stronger confirmed opposing direction.
-                if side['veto'] or (not opposite['veto'] and opposite['score'] >= 6.5 and opposite['score'] >= side['score'] + 1):
-                    reasons = ', '.join(side.get('veto_reasons', [])) or 'confirmed opposing 5m thesis'
-                    self._transition(rec, 'INVALIDATED', 'Setup invalidated: ' + reasons + '. Do not use the old entry; review any open position.')
+                # Only directional thesis failures belong to post-entry review.
+                # Entry timing (extension, exhaustion, room, weak fresh momentum)
+                # must never withdraw a trade simply because it moved favourably.
+                directional = [r for r in side.get('veto_reasons', [])
+                               if r in {'15m regime opposite', '1h strongly opposite'}
+                               or r.startswith(('bearish 5m shock not reclaimed', 'bullish 5m shock not reclaimed'))]
+                reversal = not opposite['veto'] and opposite['score'] >= 6.5 and opposite['score'] >= side['score'] + 1
+                if directional or reversal:
+                    reasons = ', '.join(directional) or 'confirmed opposing 5m thesis'
+                    self._warn(rec, '5m-thesis', reasons)
 
     def review_news(self):
         now = self.clock()
@@ -359,7 +387,9 @@ class ReliableScanner:
                     event = risks[0]
                     reason = (f"Event risk: {event.title}\n{event.source}: {event.url}\n"
                               "Previous entry withdrawn. Review open exposure; wait for a new confirmed setup.")
-                    if rec['status'] in ACTIVE:
+                    if rec['status'] in ACTIVE and rec.get('delivered_at'):
+                        self._warn(rec, 'news:' + event.id, reason)
+                    elif rec['status'] in ACTIVE:
                         self._transition(rec, 'NEWS_WITHDRAWN', reason, event.id)
                     else:
                         self._queue(f"position-news:{rec['id']}:{event.id}", self._update_message(rec,
@@ -373,6 +403,8 @@ class ReliableScanner:
         return fetch_yahoo_1m(rec['item'].get('data_symbol', rec['symbol']))
 
     def _pending_is_valid(self, rec):
+        if rec.get('entry_withdrawn'):
+            return False
         if self.clock().timestamp() - parse_time(rec['created_at']).timestamp() > self.settings.get('entry_delivery_ttl_seconds', 45):
             return False
         if self.news.gate(rec['item'], self.clock()):
@@ -453,8 +485,17 @@ class ReliableScanner:
             if rec['monitoring_degraded']:
                 rec['monitoring_degraded'] = False
                 self._queue('recovered:' + ident + ':' + now.isoformat(), self._update_message(rec, 'Fresh price monitoring restored.'), ident)
+            deadline = parse_time(rec['delivered_at']) + timedelta(minutes=rec.get('horizon_minutes', self.settings.get('max_signal_minutes', 180)))
             bars = closed_bars(frame, 1, now)
+            bars = bars.loc[bars.index + pd.Timedelta(minutes=1) <= deadline]
             start = pd.Timestamp(rec['delivered_at']).ceil('min')
+            # The delivery minute mixes pre-alert and post-alert extremes.
+            # If a displayed exit was touched there, its sequence is unknowable.
+            entry_minute = bars.loc[(bars.index < start) & (bars.index >= pd.Timestamp(rec['delivered_at']).floor('min'))]
+            for _, entry_bar in entry_minute.iterrows():
+                touched = (entry_bar.Low <= rec['stop'] or entry_bar.High >= rec['tp1']) if rec['side'] == 'LONG' else (entry_bar.High >= rec['stop'] or entry_bar.Low <= rec['tp1'])
+                if touched:
+                    rec['path_uncertain'] = True
             last = pd.Timestamp(rec['last_bar']) if rec.get('last_bar') else None
             new = bars.loc[bars.index >= start]
             if last is not None:
@@ -463,6 +504,7 @@ class ReliableScanner:
                 expected = last + pd.Timedelta(minutes=1) if last is not None else start
                 if idx > expected:
                     rec['monitor_gap'] = True
+                rec['last_mark'] = {'price': float(bar.Close), 'at': (idx + pd.Timedelta(minutes=1)).isoformat()}
                 reason = evaluate_bar(rec, bar, idx.isoformat())
                 rec['last_bar'] = idx.isoformat()
                 last = idx
@@ -475,6 +517,9 @@ class ReliableScanner:
                     else:
                         self._transition(rec, rec['status'], reason)
                         return
+            if now >= deadline:
+                self._finish_time(rec, deadline)
+                return
             # A current observed stop breach warrants an immediate warning even
             # before candle close, but must not fabricate a precise fill/P&L.
             latest = clean_frame(frame).iloc[-1]
@@ -485,7 +530,9 @@ class ReliableScanner:
                 price = float(latest.Close)
                 breached = price <= rec['stop'] if rec['side'] == 'LONG' else price >= rec['stop']
                 if breached:
-                    self._transition(rec, 'INVALIDATED', 'Latest available price is beyond the stop. Do not use this setup; check the broker immediately. The exact crossing time and fill are unverified.')
+                    if latest.name < start:
+                        rec['path_uncertain'] = True
+                    self._warn(rec, 'stop-breach', 'Latest available price is beyond the stop. Check the broker immediately. The exact crossing time and fill are unverified.')
                     return
             tail = bars.loc[bars.index >= start].tail(2)
             trigger = rec['context']['trigger_level']
@@ -493,7 +540,7 @@ class ReliableScanner:
             if len(tail) == 2 and continuous_tail(tail, 1, 2):
                 failed = (tail.Close < trigger - buffer).all() if rec['side'] == 'LONG' else (tail.Close > trigger + buffer).all()
                 if failed:
-                    self._transition(rec, 'INVALIDATED', 'Breakout failed: two completed 1m candles lost the trigger level. Previous entry withdrawn; review any open position.')
+                    self._warn(rec, 'breakout-failed', 'Breakout failed: two completed 1m candles lost the trigger level.')
                     return
             if len(bars.loc[bars.index >= start]) >= 2:
                 last_bar = bars.iloc[-1]
@@ -501,9 +548,22 @@ class ReliableScanner:
                 atr = float(rec['context'].get('atr_value') or 0)
                 opposite = last_bar.Close < last_bar.Open if rec['side'] == 'LONG' else last_bar.Close > last_bar.Open
                 if atr > 0 and opposite and body >= 0.8 * atr:
-                    self._transition(rec, 'INVALIDATED', 'New opposing 1m price shock undermines the setup. Previous entry withdrawn; review any open position.')
+                    self._warn(rec, '1m-shock', 'New opposing 1m price shock undermines the setup.')
                     return
             self._save(rec)
+
+    def _finish_time(self, rec, deadline):
+        mark = rec.get('last_mark')
+        if (mark and 0 <= (deadline - parse_time(mark['at'])).total_seconds() <= 60
+                and not rec.get('monitor_gap') and not rec.get('path_uncertain')):
+            risk = abs(rec['price'] - rec['stop'])
+            move = (mark['price'] - rec['price']) / risk * (1 if rec['side'] == 'LONG' else -1)
+            r1 = abs(rec['tp1'] - rec['price']) / risk
+            rec['result_r'] = .7 * r1 + .3 * move if rec.get('tp1_at') else move
+            rec['exit_mark'] = mark
+            self._transition(rec, 'TIME_EXIT', 'Time limit: hypothetical exit at the last completed minute close before the deadline; not a broker fill.')
+        else:
+            self._transition(rec, 'EXPIRED', 'Time limit reached without a complete price path. Outcome UNKNOWN; retained in report coverage.')
 
     def monitor_once(self):
         now = self.clock()
@@ -527,9 +587,12 @@ class ReliableScanner:
         with self.lock, self.db:
             for rec in self.records():
                 origin = rec.get('delivered_at') or rec['created_at']
-                limit = self.settings.get('max_signal_minutes', 180) if rec.get('delivered_at') else 2
+                limit = rec.get('horizon_minutes', self.settings.get('max_signal_minutes', 180)) if rec.get('delivered_at') else 2
                 if (now - parse_time(origin)).total_seconds() >= limit * 60:
-                    self._transition(rec, 'EXPIRED', 'Signal time limit reached. Entry withdrawn; no flat-price or profitable exit is assumed.')
+                    if rec.get('delivered_at'):
+                        self._finish_time(rec, parse_time(origin) + timedelta(minutes=limit))
+                    else:
+                        self._transition(rec, 'EXPIRED', 'Undelivered entry expired.')
 
     def process_position_prices(self, rec, frame):
         """Never infer a broker close from a quote or signal expiry."""
@@ -597,7 +660,7 @@ class ReliableScanner:
         self.news.refresh()
         self.review_news()
         self.system_notice('startup:' + self.clock().isoformat(),
-            '✅ Scanner upgrade online: entry-minute stop warnings, persistent position tracking, prioritised risk checks.\n'
+            '✅ Scanner update: post-entry rules separated from entry filters. Risk warnings retain original stop/target tracking; /report includes time exits and unknown outcomes.\n'
             f"Alerts: {'A-tier + filtered B+ (SPECULATIVE)' if self.settings.get('allow_fast', False) else 'A-tier only'}.\n"
             'Checks: news every 120s; active prices about every 60s when feeds/quota allow. These are not guaranteed delivery times.\n'
             'Use /help for /entered, /skipped, /closed, /status and /report. Controls only update tracking; no broker orders are changed.')

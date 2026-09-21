@@ -32,7 +32,7 @@ def performance_report(records, slippage_r=0.10):
     """Report eligibility, not a fabricated broker equity curve or win rate."""
     delivered = [r for r in records if r.get('delivered_at')]
     eligible = sorted([r for r in delivered if r.get('message_id') and not r.get('monitor_gap')
-                       and r['status'] in {'STOPPED', 'TP2_HIT'}
+                       and not r.get('path_uncertain') and r['status'] in {'STOPPED', 'TP2_HIT', 'TIME_EXIT'}
                        and isinstance(r.get('result_r'), (float, int))
                        and math.isfinite(r['result_r'])], key=lambda r: r.get('closed_at', r['created_at']))
     # A missing legacy spread estimate cannot silently count as zero cost.
@@ -46,11 +46,14 @@ def performance_report(records, slippage_r=0.10):
         drawdown = max(drawdown, peak - equity)
     groups = defaultdict(list)
     for r, value in zip(eligible, values):
-        groups[str(r.get('context', {}).get('trigger_mode', 'unclassified'))].append(value)
+        ctx = r.get('context', {})
+        key = f"v{ctx.get('lifecycle_version', 'legacy')} / {ctx.get('quality_tier', '?')} / {ctx.get('trigger_mode', 'unclassified')}"
+        groups[key].append(value)
     statuses = Counter(r['status'] for r in delivered if r not in eligible)
     lines = [f'Forward reference-price report: {len(delivered)} delivered/possibly delivered alerts.',
              f'Complete eligible outcomes: {len(values)}; unscored/open: {len(delivered) - len(values)}.',
              f'Costs: recorded spread estimate + assumed {slippage_r:.2f}R slippage per trade.']
+    lines.append(f'Outcome coverage: {len(values)}/{len(delivered)}; risk-warned alerts: {sum(bool(r.get("risk_warnings")) for r in delivered)}.')
     if values:
         lines += [f'Net sensitivity: {sum(values):+.2f}R; average {sum(values)/len(values):+.2f}R.',
                   f'Positive net outcomes: {sum(v > 0 for v in values)}/{len(values)}.',
@@ -61,7 +64,7 @@ def performance_report(records, slippage_r=0.10):
         lines.append('No eligible completed sample yet. No win rate or edge can be claimed.')
     if statuses:
         lines.append('Other states: ' + ', '.join(f'{k}={v}' for k, v in sorted(statuses.items())))
-    lines.append('Excludes uncertain paths, withdrawals and ambiguous candles; this can bias the sample. '
+    lines.append('Original stop/target/time scenarios continue after warnings, regardless of user actions. Unknown/legacy withdrawals remain unscored; incomplete coverage can bias results. '
                  'These are hypothetical results, NOT actual fills/P&L or proof of profitability.')
     return '\n'.join(lines)
 
@@ -200,7 +203,7 @@ class TelegramControls:
                     'fill_source': 'user_reported' if fill is not None else 'not_supplied'}
             status = 'ENTERED'
             reply = f'Marked #{ident} OPEN. Monitoring continues until /closed {ident}, even if the alert expires or is invalidated. No broker order was placed.'
-            if rec['status'] not in {'OPEN', 'TP1_OPEN'}:
+            if rec.get('entry_withdrawn') or rec['status'] not in {'OPEN', 'TP1_OPEN'}:
                 reply += '\n⚠️ The underlying setup is already withdrawn/finished. This records your existing trade; it does NOT recommend entering now.'
         elif name == '/skipped':
             if args:
