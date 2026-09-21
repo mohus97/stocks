@@ -54,8 +54,9 @@ def test_new_news_withdraws_existing_signal_once(engine, signal, clock):
     engine.review_news()
     engine.deliver_once()
     row = engine.records(False)[0]
-    assert row['status'] == 'NEWS_WITHDRAWN'
-    assert sum('NEWS_WITHDRAWN' in text for text in engine.sent) == 1
+    assert row['status'] == 'OPEN' and row['entry_withdrawn']
+    assert 'news:war1' in row['risk_warnings']
+    assert sum('RISK WARNING' in text for text in engine.sent) == 1
     assert any(e.url in text for text in engine.sent)
 
 
@@ -128,7 +129,8 @@ def test_failed_breakout_warns_before_stop(engine, signal, clock):
     d = frame('2026-09-17 12:01', [(99.4,99.5,99.1,99.3), (99.3,99.4,99.1,99.2), (99.2,99.3,99.1,99.2)])
     engine.process_prices(rec['id'], d)
     engine.deliver_once()
-    assert engine.records(False)[0]['status'] == 'INVALIDATED'
+    assert engine.records()[0]['entry_withdrawn']
+    assert 'breakout-failed' in engine.records()[0]['risk_warnings']
     assert any('Breakout failed' in text for text in engine.sent)
 
 
@@ -138,7 +140,8 @@ def test_intrabar_stop_breach_alerts_without_claiming_a_fill(engine, signal, clo
     d = frame('2026-09-17 12:01', [(100,100.1,97.5,97.9)])
     engine.process_prices(rec['id'], d)
     result = engine.records(False)[0]
-    assert result['status'] == 'INVALIDATED' and result['result_r'] is None
+    assert result['status'] == 'OPEN' and result['result_r'] is None
+    assert 'stop-breach' in result['risk_warnings']
 
 
 def test_ambiguous_bar_is_not_counted_as_a_win(engine, signal, clock):
@@ -253,7 +256,7 @@ def test_active_5m_reversal_withdraws_thesis(engine, signal, clock, monkeypatch)
                     'SHORT': {'veto': False, 'score':7.}}}
     monkeypatch.setattr(scanner, '_decision_snapshot', lambda *args: snap)
     engine.observe_5m(frame('2026-09-17 12:05',[(100,101,99,100)]), {'symbol':'NVDA','type':'stock'})
-    assert engine.records(False)[0]['status'] == 'INVALIDATED'
+    assert '5m-thesis' in engine.records()[0]['risk_warnings']
 
 
 def test_opposite_short_breakout_failure(engine, signal, clock):
@@ -263,7 +266,7 @@ def test_opposite_short_breakout_failure(engine, signal, clock):
     clock.advance(180)
     engine.process_prices(rec['id'], frame('2026-09-17 12:01',
         [(100.6,100.9,100.5,100.7),(100.7,101,100.6,100.8),(100.8,101,100.7,100.8)]))
-    assert engine.records(False)[0]['status'] == 'INVALIDATED'
+    assert 'breakout-failed' in engine.records()[0]['risk_warnings']
 
 
 def test_filtered_bplus_is_delivered_with_speculative_label(engine, signal, cfg):

@@ -32,9 +32,10 @@ def test_entry_minute_current_close_warns_but_no_fill_is_inferred(engine, signal
     clock.advance(20)
     engine.process_prices(rec['id'], frame('2026-09-17 12:00', rows))
     result = engine.records(False)[0]
-    assert result['status'] == 'INVALIDATED'
+    assert result['status'] == 'OPEN' and result['entry_withdrawn']
+    assert result['path_uncertain']
     assert result['result_r'] is None
-    assert 'crossing time' in result['reason']
+    assert 'crossing time' in result['risk_warnings']['stop-breach']['reason']
 
 
 def test_entry_minute_old_extremes_do_not_trigger_warning(engine, signal, clock):

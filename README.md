@@ -28,8 +28,9 @@ Unmarked alerts still receive normal hypothetical monitoring.
 results by setup, and cumulative closed-outcome drawdown. It subtracts recorded
 spread estimates and a configurable **assumed** 0.10R slippage sensitivity;
 this is not measured execution slippage or an actual-account equity curve.
-Excluding withdrawals and uncertain paths can bias the scored sample. No edge
-or win rate is claimed before there are eligible outcomes.
+Reports include outcome coverage and separate lifecycle-version/tier/setup cohorts.
+Legacy withdrawals and uncertain paths stay visibly unscored and can bias the
+sample. Eligible simulated results do not prove a tradable edge.
 
 Commands are accepted only from the configured Telegram chat and its matching
 private-chat user. Group chats additionally require explicitly configured
@@ -67,11 +68,14 @@ a win/loss, a crossing time or a broker fill.
   1.00R, also 70% / 30%. **The original stop remains for the runner**. The exact
   prices and fractions displayed in Telegram are also stored and monitored.
   No silent break-even move or old 1.5R/2.5R tracking mismatch.
-- Independent price/news workers withdraw a setup for a confirmed opposing 5m
+- Independent price/news workers warn and revoke new-entry permission for a confirmed opposing 5m
   thesis, a new opposing 1m shock, two closed 1m candles losing the trigger,
   an observed stop breach, or relevant event risk. Updates reference the
   original alert ID and detection time. News risk is a withdrawal of the old
-  entry, not an assertion that a filled trade necessarily lost money.
+  entry, not an assertion that a filled trade necessarily lost money. The original
+  stop/target scenario continues after warnings, including through restarts.
+  Entry-only extension, exhaustion, nearby structure and fresh-score filters
+  no longer withdraw an issued trade. Each warning reason is logged by ID.
 - An unavailable event feed pauses new entries. Stale/missing prices, quota
   exhaustion, and worker failures create explicit monitoring warnings. A dead
   monitoring/delivery worker cannot silently authorize new entries.
@@ -150,7 +154,12 @@ cancelled; warnings are retained. None of these paths executes a brokerage trade
 being monitored, not that a user entered a position. Outcome bars must begin
 at/after the delivery minute ceiling; the partly elapsed alert candle is
 excluded. Same-bar stop/target ambiguity, monitoring gaps, unverified delivery,
-withdrawals and expiries have no assigned final R. Complete known-path scenarios
+legacy withdrawals and missing-path expiries have no assigned final R. Delivery-minute
+exit touches are uncertain because pre/post-alert sequencing is unknown. Warnings
+do not end the scenario or erase partial target progress. At the persisted time
+limit (default 180 minutes), a complete path uses the last closed-minute price
+ending at most 60 seconds before the deadline for a labelled hypothetical
+`TIME_EXIT`. No later bars may improve that result. Complete known-path scenarios
 store gross `result_r` and `result_r_net_estimate` after the spread estimate;
 they are not actual fills/P&L. Partial exits are weighted and gap losses can
 exceed 1R. Old `scanner_performance.json` statistics are preserved, not silently
@@ -205,3 +214,13 @@ failure instead of removing the gate. The earlier commit has no such check.
 Setting `reliability.enabled: false` returns to the legacy runtime, including
 its old alert/tracker policy; that is a rollback switch, not an equally protected
 mode. Use the reliable runtime for the fixes documented here.
+
+### Lifecycle v3 validation
+
+Regression replays cover favourable extension without withdrawal, genuine
+directional warnings, news warnings followed by losses, warnings followed by
+targets, TP1 plus runner stop, long/short time exits, missing paths, entry-minute
+ambiguity, retries and restarts. These are deterministic correctness tests, not
+a historical strategy backtest or profitability evidence. Old invalidated
+alerts are not resurrected or assigned invented exits. New v3 forward outcomes
+must be evaluated after costs with adequate coverage before any profit claim.
