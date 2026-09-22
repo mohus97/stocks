@@ -129,17 +129,39 @@ def instrument_currencies(item):
 
 
 def headline_relevant(event, item):
+    """Match news to the instrument instead of turning every macro headline into a
+    market-wide blackout.  Broad shocks stay broad; sector/commodity shocks stay
+    scoped to assets that can plausibly be affected."""
     title = event.title.lower()
     currencies = instrument_currencies(item)
-    if re.search(r'\b(invasion|invades|air ?strikes?|missile strikes?|nuclear attack|strait of hormuz|'
-                 r'banking crisis|emergency rate|oil embargo|trade war|ceasefire|cease-fire|tariffs?)\b', title):
+    kind = item.get('type')
+    symbol = str(item.get('symbol', '')).upper()
+
+    # True market-wide shocks: these can reasonably invalidate entries across the
+    # whole watchlist.  Do NOT include every mention of a geopolitical flashpoint.
+    if re.search(r'\b(bank(?:ing)? crisis|emergency rate|oil embargo|trade war|'
+                 r'nuclear attack|invasion|missile strikes?|air ?strikes?)\b', title):
         return True
-    # A country plus a background mention of "war" is not a fresh shock.
-    # Keep concrete conflict actions and explicit outbreak/escalation language.
-    if re.search(r'\b(iran|israel|russia|ukraine|china|taiwan)\b', title) and re.search(
-            r'\b(attacks?|strikes?|bombing|bombardment|blockade|invasion|'
-            r'(?:declares?|declared|declaration of) war|war (?:begins|erupts|breaks out|escalates|widens|spreads))\b', title):
-        return True
+
+    # Hormuz/energy headlines are important, but are not automatically relevant
+    # to every US stock.  Keep them on gold/FX and broad indices, where the
+    # transmission channel is direct enough to justify a temporary pause.
+    energy_shock = re.search(r'\b(strait of hormuz|hormuz|oil prices?|crude oil|'
+                             r'brent|wti|oil supply|oil falls|oil rises)\b', title)
+    if energy_shock:
+        return kind in {'metal', 'forex', 'index'} or symbol in {
+            'XAUUSD', '^NDX', '^GSPC', '^DJI', '^FTSE', '^GDAXI'
+        }
+
+    # Explicit geopolitical escalation is broad enough for indices/FX/gold, but
+    # still should not freeze unrelated single-name equities.
+    geopolitical = re.search(r'\b(iran|israel|russia|ukraine|china|taiwan)\b', title) and re.search(
+        r'\b(attacks?|strikes?|bombing|bombardment|blockade|invasion|'
+        r'(?:declares?|declared|declaration of) war|war (?:begins|erupts|breaks out|'
+        r'escalates|widens|spreads))\b', title)
+    if geopolitical:
+        return kind in {'metal', 'forex', 'index'}
+
     economic = re.search(r'\b(interest rates?|rate (cut|rise|hike|decision)|inflation|cpi|payrolls?|'
                          r'jobs report|monetary policy|fomc|economic recession)\b', title)
     if economic:
@@ -151,12 +173,14 @@ def headline_relevant(event, item):
             return 'EUR' in currencies
         if re.search(r'\b(japan|boj|bank of japan)\b', title):
             return 'JPY' in currencies
-        return True  # Unattributed macro surprise: conservative temporary pause.
+        return True
+
     if event.source == 'fed':
-        return 'USD' in currencies  # This feed is specifically monetary policy.
-    if item.get('type') != 'stock':
+        return 'USD' in currencies
+
+    if kind != 'stock':
         return False
-    symbol = item['symbol'].upper()
+
     aliases = {
         'ARM': ['arm holdings', 'arm shares', 'arm stock'],
         'MSTR': ['microstrategy', 'strategy shares', 'strategy stock'],
